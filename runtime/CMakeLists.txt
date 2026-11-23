@@ -111,7 +111,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/file_system.cpp
     shims/winhttp_offline.cpp
     shims/xmem.cpp
-    shims/audio_stub.cpp
+    shims/xg_xs.cpp
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
     shims/xgameruntime.cpp
@@ -224,32 +224,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
 
-  # Audio boot shims: AcpHal.dll, xapu.dll and chad.dll. Resolves every name through the registry and calls it with
-  # valid, null and fake arguments. The three measured out-pointer calls get real buffers. No game data, no device.
-  add_executable(audio_stub_test
-    test/audio_stub_test.cpp
-    shims/audio_stub.cpp
-    shims/registry.cpp
-  )
-  target_include_directories(audio_stub_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
-  target_compile_definitions(audio_stub_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-  target_compile_options(audio_stub_test PRIVATE /W4 /permissive- /utf-8)
-  target_link_options(audio_stub_test PRIVATE /OPT:NOREF)
-
-  # XCRDAPI's only import, DStorageGetFactory: the registry binding and the non-null IUnknown factory token the
-  # retail executable's first XCRDAPI call stops on.
-  add_executable(xcrdapi_test
-    test/xcrdapi_test.cpp
-    shims/xcrdapi.cpp
-    shims/registry.cpp
-  )
-  target_include_directories(xcrdapi_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
-  target_compile_definitions(xcrdapi_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-  target_compile_options(xcrdapi_test PRIVATE /W4 /permissive- /utf-8)
-  target_link_options(xcrdapi_test PRIVATE /OPT:NOREF)
-
-  # xg_xs.dll's two measured exports: object storage for XGCreateTextureComputer and the no-write suggestion/computer
-  # slots. The test resolves both through the registry, as the mapped title does.
+  # xg_xs shim: the two exports and the texture computer's slots against the measured call shapes.
   add_executable(xg_xs_test
     test/xg_xs_test.cpp
     shims/xg_xs.cpp
@@ -259,13 +234,6 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(xg_xs_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(xg_xs_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(xg_xs_test PRIVATE /OPT:NOREF)
-
-  # The Zen 2 instructions a desktop CPU may lack (src/cpu_emulation.h): decoded, emulated on a CONTEXT, and run for
-  # real with the #UD handler installed, so an Intel host takes the emulated path and an AMD one the native path.
-  add_executable(cpu_emulation_test test/cpu_emulation_test.cpp)
-  target_include_directories(cpu_emulation_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  target_compile_definitions(cpu_emulation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-  target_compile_options(cpu_emulation_test PRIVATE /W4 /permissive- /utf-8)
 
   # The process shim's command line: GetCommandLineW must parse (CommandLineToArgvW) back to its __wargv.
   add_executable(process_cmdline_test
@@ -700,6 +668,31 @@ if(BUILD_TESTING)
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
       )
     endforeach()
+    # These linker-selected startup modes are specific to the MSVC CRT.
+    if(MSVC)
+      foreach(width a w)
+        foreach(mode default expand noargs)
+          set(target tiny_argv_${mode}_${width})
+          add_executable(${target} test/fixtures/tiny_argv_modes.cpp)
+          target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+          target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8)
+          if(width STREQUAL "w")
+            target_compile_definitions(${target} PRIVATE APP_WIDE)
+          endif()
+          if(mode STREQUAL "expand")
+            if(width STREQUAL "w")
+              target_link_options(${target} PRIVATE wsetargv.obj)
+            else()
+              target_link_options(${target} PRIVATE setargv.obj)
+            endif()
+          elseif(mode STREQUAL "noargs")
+            target_link_options(${target} PRIVATE noarg.obj)
+          endif()
+          set_target_properties(${target} PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>")
+        endforeach()
+      endforeach()
+    endif()
     add_executable(tiny_atexit test/fixtures/tiny_atexit.cpp)
     target_compile_definitions(tiny_atexit PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_atexit PRIVATE /W4 /permissive- /utf-8)
@@ -1058,12 +1051,6 @@ if(BUILD_TESTING)
   if(WIN32 AND TARGET xmem_test)
     add_test(NAME xmem COMMAND xmem_test)
   endif()
-  if(WIN32 AND TARGET audio_stub_test)
-    add_test(NAME audio_stub COMMAND audio_stub_test)
-  endif()
-  if(WIN32 AND TARGET xcrdapi_test)
-    add_test(NAME xcrdapi COMMAND xcrdapi_test)
-  endif()
   if(WIN32 AND TARGET xg_xs_test)
     add_test(NAME xg_xs COMMAND xg_xs_test)
   endif()
@@ -1156,6 +1143,16 @@ if(BUILD_TESTING)
     set_tests_properties(gameinput PROPERTIES DISABLED TRUE)
   endif()
   if(WIN32 AND TARGET gta6rt AND TARGET tiny_game)
+    if(TARGET tiny_argv_default_a AND NOT CMAKE_CROSSCOMPILING)
+      find_package(Python3 COMPONENTS Interpreter QUIET)
+      if(Python3_FOUND)
+        add_test(NAME run_argv_modes COMMAND "${Python3_EXECUTABLE}" -I
+          "${CMAKE_CURRENT_SOURCE_DIR}/test/check_argv_modes.py"
+          --loader "$<TARGET_FILE:gta6rt>" --fixtures "$<TARGET_FILE_DIR:tiny_argv_default_a>"
+          --work-dir "${CMAKE_CURRENT_BINARY_DIR}")
+        set_tests_properties(run_argv_modes PROPERTIES TIMEOUT 90)
+      endif()
+    endif()
     add_test(NAME run_startup_cmdline COMMAND ${CMAKE_COMMAND}
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_startup_cmdline>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_startup_cmdline.cmake")
@@ -1284,6 +1281,10 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(${tool} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
   endforeach()
+  # OpFmaKHR width gate of vk_shader_fma.h (shaderFmaFloat32 / shaderFmaFloat64): no Vulkan instance, no GPU.
+  add_executable(vk_shader_fma_test test/vk_shader_fma_test.cpp)
+  target_link_libraries(vk_shader_fma_test PRIVATE Vulkan::Headers)
+  add_test(NAME vk_shader_fma COMMAND vk_shader_fma_test)
   if(MSVC)
     # Keep the checker and its worker threads on the toolchain's C++ runtime under Wine.
     set_property(TARGET vk_pipeline_check PROPERTY
@@ -2027,6 +2028,17 @@ if(TARGET Vulkan::Headers)
       SKIP_RETURN_CODE 77
       FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
+    # ClearState predication reset (GPU readback) + SetPredication / AtomicCopyBuffer Close() parity against WARP & HW.
+    add_executable(d3d12_predication_atomic_copy_test test/d3d12_predication_atomic_copy_test.cpp)
+    target_link_libraries(d3d12_predication_atomic_copy_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_predication_atomic_copy_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_predication_atomic_copy_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_predication_atomic_copy COMMAND d3d12_predication_atomic_copy_test)
+    set_tests_properties(d3d12_predication_atomic_copy PROPERTIES
+      SKIP_RETURN_CODE 77
+      FAIL_REGULAR_EXPRESSION "Validation Error;VUID-"
+    )
+
     # Differential regression: run explicitly (requires Vulkan hardware and Windows WARP).
     add_executable(d3d12_clear_test test/d3d12_clear_test.cpp)
     target_link_libraries(d3d12_clear_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
@@ -2730,6 +2742,19 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_draw_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_draw COMMAND d3d12_draw_test)
       set_tests_properties(d3d12_draw PROPERTIES SKIP_RETURN_CODE 77)
+      # Graphics & compute PSO descriptor validation parity against live Windows D3D12 (WARP and HW).
+      add_executable(d3d12_pso_validation_test test/d3d12_pso_validation_test.cpp ${LEONIDA_TEST_VS}
+                     ${LEONIDA_TEST_PS} ${LEONIDA_TEST_PS_UINT} ${LEONIDA_TEST_VS_FULLSCREEN} ${LEONIDA_TEST_CS})
+      target_link_libraries(d3d12_pso_validation_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+      target_compile_definitions(d3d12_pso_validation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_SPV="${LEONIDA_TEST_VS}" LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}"
+                                 LEONIDA_TEST_PS_UINT_SPV="${LEONIDA_TEST_PS_UINT}"
+                                 LEONIDA_TEST_VS_FULLSCREEN_SPV="${LEONIDA_TEST_VS_FULLSCREEN}"
+                                 LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}")
+      target_compile_options(d3d12_pso_validation_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_pso_validation COMMAND d3d12_pso_validation_test)
+      set_tests_properties(d3d12_pso_validation PROPERTIES SKIP_RETURN_CODE 77
+                           FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
       # Conservative raster Tier 1, with geometric coverage bounds and host D3D12 references.
       set(LEONIDA_CONSERVATIVE_VS ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_conservative.spv)
       set(LEONIDA_CONSERVATIVE_PS ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_conservative.spv)
@@ -3006,6 +3031,15 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_clear_formats_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_clear_formats COMMAND d3d12_clear_formats_test)
     set_tests_properties(d3d12_clear_formats PROPERTIES SKIP_RETURN_CODE 77)
+
+    # SetDescriptorHeaps validation, Reset/ClearState/bundle parity, lifetime pinning, direct-index flags.
+    add_executable(d3d12_set_descriptor_heaps_test test/d3d12_set_descriptor_heaps_test.cpp)
+    target_link_libraries(d3d12_set_descriptor_heaps_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_set_descriptor_heaps_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_set_descriptor_heaps_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_set_descriptor_heaps COMMAND d3d12_set_descriptor_heaps_test)
+    set_tests_properties(d3d12_set_descriptor_heaps PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
     # The loader can create this device instead of the host's (D3D12XboxCreateDevice, LEONIDA_D3D12=vulkan).
     if(TARGET gta6rt)

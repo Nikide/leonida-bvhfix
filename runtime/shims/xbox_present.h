@@ -3,24 +3,27 @@
 // The Xbox presentation core (docs/d3d12_vulkan.md section 4.5): the frame events and PresentX of a GDKX title, which
 // presents without a DXGI swapchain. FramePacer (src/frame_pacer.h) does the timing and the token bookkeeping;
 // WindowPresenter (d3d12_com.h, over leonida::VulkanPresenter) puts the pixels in a window. This class is the
-// glue, and the surface the Xbox device and queue proxy will forward to once the vtable slots are known.
+// glue, and the surface the Xbox device and queue proxy will forward to.
 //
-// WHAT IS KNOWN: the public GDKX samples give the call order, the argument counts and the field names (section 4.5).
-// WHAT IS OURS: every struct layout, constant value and HRESULT below is a provisional definition of this layer; the real
-// slots, layouts, enum values and the token width are unmeasured. They are named like the console's so the proxy
-// can swap them, but nothing here may be read as the console's ABI.
+// WHAT IS KNOWN: the public GDKX samples give the call order and the argument counts; public code that is not
+// Microsoft documentation gives most of the slots and the x64 layouts (docs/d3d12_xs_surface.md 7.1):
+//   - ebiten (Apache-2.0) mirrors the GDK structs in Go: D3D12XBOX_PRESENT_PLANE_PARAMETERS is 0x48 bytes on x64,
+//     D3D12XBOX_PRESENT_PARAMETERS 0x20 bytes, and D3D12XBOX_FRAME_PIPELINE_TOKEN is uint64.
+//   - XCL (GPL-2.0-only, facts only) measured the frame calls on device slots 78-81 and PresentX on queue slot 30
+//     (older runtime layout: XDefiant, Minecraft, Fortnite) or 32 (newer: Unicorn Overlord).
+// WHAT IS OURS: the constant values, the HRESULT choices and the ScaleFilter/plane-flag values; the real enum
+// values are still unmeasured. The SuspendX/ResumeX slots are not in any public source.
 //
-// TODO, the slots to measure before the proxy can forward (index in the vtable of the Xbox device / queue):
-//   ID3D12Device (Xbox):        SetFrameIntervalX   (output, interval, latency, flags)           slot ?
-//                               ScheduleFrameEventX (event, offset, reserved pointer, flags)     slot ?
-//                               WaitFrameEventX     (event, timeout ms, reserved pointer, flags, &token)  slot ?
-//                               GetFrameStatisticsX (token, type mask, &count, array)            slot ?
-//   ID3D12CommandQueue (Xbox):  PresentX (plane count, planes, params)                           slot ?
-//                               SuspendX (flags)                                                 slot ?
-//                               ResumeX ()                                                       slot ?
-// The queue slots can be named at run time by LEONIDA_PRESENTX_SLOT, LEONIDA_PRESENTX_SUSPEND_SLOT and
-// LEONIDA_PRESENTX_RESUME_SLOT (presentx_capture.h) and a routed PresentX can be captured without a window; the real
-// slot numbers, the device slots and the struct layouts are still unmeasured.
+// Slots (0-based, QueryInterface = 0) before the proxy can forward:
+//   ID3D12Device (Xbox):        SetFrameIntervalX   (output, interval, latency, flags)                    78
+//                               ScheduleFrameEventX (event, offset, reserved pointer, flags)              79
+//                               WaitFrameEventX     (event, timeout ms, reserved pointer, flags, &token)   80
+//                               GetFrameStatisticsX (token, type mask, &count, array)                     81
+//   ID3D12CommandQueue (Xbox):  PresentX (plane count, planes, params)                                    30 (older) / 32 (newer)
+//                               SuspendX (flags)                                                        slot unknown
+//                               ResumeX ()                                                              slot unknown
+// The public numbers are measurements of other titles' runtimes, not of this game. The runtime version moves
+// PresentX, so neither value may be assumed; trace the game's slots.
 // The queue-side calls do not look at the queue: the Vulkan device has one VkQueue behind every D3D12 queue, and
 // the present is submitted after the work already executed on it.
 
@@ -43,6 +46,57 @@ inline constexpr std::uint32_t xbox_frame_interval_30hz_us = 33333;
 inline constexpr std::uint32_t xbox_frame_interval_60hz_us = 16667;
 inline constexpr std::uint32_t xbox_frame_interval_120hz_us = 8333;
 
+// D3D12XBOX_PRESENT_PLANE_PARAMETERS. The names and the x64 layout are confirmed by the public ebiten Go binding
+// (Apache-2.0, internal/graphicsdriver/directx/d3d12_windows.go, _D3D12XBOX_PRESENT_PLANE_PARAMETERS) and by XCL's
+// reads of the first three fields: 0x48 bytes, Token @0x00, ResourceCount @0x08, ppResources @0x10, pSrcViewRects
+// @0x18, pDestPlacementBase @0x20, ColorSpace @0x28, ScaleFilter @0x2C, ExtendedDescCount @0x30, pExtendedDescs
+// @0x38, Flags @0x40. The enum values and flag bits remain unmeasured; the values below are placeholders that make
+// the composition (section 4.5) testable.
+//
+// Zero everything is the default and means "as before": the whole output, bilinear when scaling, SDR, plane 1
+// premultiplied and not composed.
+struct XboxViewRect {  // D3D12XBOX_VIEW_RECT: four floats; as fractions 0..1 of the output (hypothesis, section 4.5)
+    float left, top, right, bottom;
+};
+// DXGI_COLOR_SPACE_TYPE values (documented DXGI numbers). Only these two are composed; any other is treated as the first.
+inline constexpr int xbox_color_space_g22_p709 = 0;       // DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709: SDR
+inline constexpr int xbox_color_space_g2084_p2020 = 12;   // DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020: HDR10
+// Provisional (ours): ScaleFilter and Flags.
+inline constexpr int xbox_scale_filter_default = 0;  // bilinear (point when not scaled makes no difference)
+inline constexpr int xbox_scale_filter_point = 1;
+inline constexpr int xbox_scale_filter_linear = 2;
+// Plane 1 is composed over plane 0 as an overlay only with this flag (hypothesis: whether the console blends a second plane
+// at all is unmeasured; the public HDR sample's plane 1 is the GameDVR copy of the frame, not shown, so without the flag
+// plane 1 is not composed, as before).
+inline constexpr UINT xbox_plane_flag_overlay = 1;
+inline constexpr UINT xbox_plane_flag_straight_alpha = 2;  // plane 1's colour is not premultiplied by its alpha
+
+struct XboxPresentPlaneParameters {
+    // Field order, types and x64 offsets: the public ebiten binding above; XCL reads Token, ResourceCount and
+    // ppResources at the same offsets. This is the console's layout on x64.
+    std::uint64_t Token;                  // from WaitFrameEventX; 64-bit storage confirmed, 0 = ..._NULL
+    UINT ResourceCount;                   // 1 in the samples
+    ID3D12Resource* const* ppResources;   // ResourceCount committed resources with ALLOW_DISPLAY, in PRESENT
+    const D3D12_RECT* pSrcViewRects;      // null, or one rectangle per resource (the HDR sample sets it)
+    const XboxViewRect* pDestPlacementBase;  // null: the whole output
+    int ColorSpace;                       // a DXGI_COLOR_SPACE_TYPE (see above)
+    int ScaleFilter;                      // xbox_scale_filter_*; anything unknown is the default
+    UINT ExtendedDescCount;               // not used (logged once when non-zero)
+    const void* pExtendedDescs;
+    UINT Flags;                           // xbox_plane_flag_*; unknown bits are ignored
+};
+
+// D3D12XBOX_PRESENT_PARAMETERS. The console's object is 0x20 bytes on x64 (ebiten): ImmediateThresholdPercent @0x00,
+// ViewCount @0x04, ExtendedDescCount @0x08, pExtendedDescs @0x10, Flags @0x18. This struct is the first 4 bytes;
+// it is only read through a pointer, so never size a copy by sizeof(XboxPresentParameters).
+struct XboxPresentParameters {
+    // 0 (the default): a frame that missed its vblank waits for the next one. Above 0: a frame that missed it is shown
+    // at once, mid-scan, when the scan is not further than this percentage down the screen (100: wherever it is).
+    // Needs VK_KHR/EXT_swapchain_maintenance1 and an IMMEDIATE or FIFO_RELAXED mode the swapchain can switch to;
+    // without them it is ignored (logged once). What late means: see FramePacer::present_timing.
+    float ImmediateThresholdPercent;
+};
+
 class XboxPresentation {
 public:
     // `clock` null: real time (a steady high-resolution timer). Tests pass a leonida::ManualFrameClock, which must
@@ -64,6 +118,9 @@ public:
     // Blocks for the next origin and while the latency is used up. HRESULT_FROM_WIN32(WAIT_TIMEOUT) after `timeout_ms`
     // (INFINITE waits for ever); `*token` is untouched then. E_INVALIDARG for a null token pointer or another event;
     // HRESULT_FROM_WIN32(ERROR_INVALID_STATE) when nothing is registered (not yet, or since SuspendX).
+    // XCL's public implementation returns S_FALSE on a finite timeout and writes the token on timeout only with
+    // flag 2, and E_INVALIDARG when the event is not scheduled; the WAIT_TIMEOUT and ERROR_INVALID_STATE here are
+    // this layer's choices and known divergences (docs/d3d12_xs_surface.md 7.1).
     HRESULT WaitFrameEventX(UINT event, DWORD timeout_ms, UINT flags, std::uint64_t* token);
     // See FramePacer::get_frame_statistics: S_FALSE and count 0 when nothing is available.
     HRESULT GetFrameStatisticsX(std::uint64_t token, UINT type_mask, UINT* count, leonida::FrameStatistic* out);

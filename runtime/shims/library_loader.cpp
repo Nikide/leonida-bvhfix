@@ -216,29 +216,19 @@ HMODULE WINAPI get_module_handle_a(LPCSTR name) {
 }
 
 HMODULE WINAPI get_module_handle_w(LPCWSTR name) {
-    if (getenv("LEONIDA_HEAP_PROBE")) {
-        std::fprintf(stderr, "[rt] heap-probe: GetModuleHandleW entry tid=%lu\n", GetCurrentThreadId());
-        std::fflush(stderr);
-        const BOOL ok = HeapValidate(reinterpret_cast<HANDLE>(_get_heap_handle()), 0, nullptr);
-        std::fprintf(stderr, "[rt] heap-probe: GetModuleHandleW entry ok=%d\n", ok);
-        std::fflush(stderr);
-    }
-    if (!name) {
-        // The process's own image: the mapped exe, not gta6rt.
-        if (void* h = bundled_main_module()) return reinterpret_cast<HMODULE>(h);
-        return GetModuleHandleW(name);
-    }
-    if (ascii_basename(name)) {
-        const std::string path = narrow(name);
-        if (HMODULE h = owned_handle(path)) return h;
-        const std::string dll = module_name(path);
-        if (!dll.empty())
-            if (void* h = find_loaded_bundled_module(dll)) return reinterpret_cast<HMODULE>(h);
-    } else {
-        // Outside ASCII: by the wide basename (narrow() would turn it into '?'), as for load_library_w.
-        const std::wstring dll = module_name_w(name);
-        if (!dll.empty())
-            if (void* h = find_loaded_bundled_module_w(dll)) return reinterpret_cast<HMODULE>(h);
+    if (name) {
+        if (ascii_basename(name)) {
+            const std::string path = narrow(name);
+            if (HMODULE h = owned_handle(path)) return h;
+            const std::string dll = module_name(path);
+            if (!dll.empty())
+                if (void* h = find_loaded_bundled_module(dll)) return reinterpret_cast<HMODULE>(h);
+        } else {
+            // Outside ASCII: by the wide basename (narrow() would turn it into '?'), as for load_library_w.
+            const std::wstring dll = module_name_w(name);
+            if (!dll.empty())
+                if (void* h = find_loaded_bundled_module_w(dll)) return reinterpret_cast<HMODULE>(h);
+        }
     }
     return GetModuleHandleW(name);
 }

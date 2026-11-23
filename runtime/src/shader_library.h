@@ -741,14 +741,13 @@ struct ShaderEntry {
 
 class ShaderLibrary {
 public:
-    // Reads <dir>/index.json, then the indexes of the programs make_game.py translates outside the game's shader
-    // entries, each when it is there:
+    // Reads <dir>/index.json, then the indexes of the programs make_game.py translates from the package's DLLs, each
+    // when it is there:
     //   - <dir>/fspx/index.json, the FidelityFX DLL's FSPX programs, entries named "fspx/<name>" (docs/fspx.md);
-    //   - <dir>/library/index.json, the compute programs of the pipeline library in shaders.rpf, which the executable
-    //     creates with slot 67; entries named "library/<name>" and found by fspx_code_sha256 and fspx_state_sha256
-    //     like the FSPX ones (docs/shader_library.md).
-    // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. The folders
-    // are optional: a missing or unreadable index there leaves the main one, and the other folders', loaded.
+    //   - <dir>/bvh/index.json, XboxBvhBuilder.dll's FSSM programs, entries named "bvh/<name>" and found by
+    //     fssm_sha256 like the game's own shaders (docs/embedded_shaders.md).
+    // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. Both folders
+    // are optional: a missing or unreadable index there leaves the main one, and the other folder's, loaded.
     bool load(const std::filesystem::path& dir, std::string* error = nullptr) {
         const auto fail = [&](const std::string& why) {
             if (error) *error = why;
@@ -760,7 +759,7 @@ public:
         } catch (...) {
             return fail("index.json could not be read");
         }
-        for (const char* folder : {"fspx", "library"}) {
+        for (const char* folder : {"fspx", "bvh"}) {
             try {
                 const auto ignore = [](const std::string&) { return false; };
                 const std::filesystem::path sub = dir / folder;
@@ -778,6 +777,9 @@ public:
     // reaches these: their programs come from FidelityFX DLLs and the pipeline library, so callers comparing reached
     // entries with size() must leave them out.
     std::size_t fspx_size() const { return fspx_count_; }
+    // Entries loaded from <dir>/bvh/index.json. No RPF container reaches these either: XboxBvhBuilder.dll passes
+    // their containers itself.
+    std::size_t bvh_size() const { return bvh_count_; }
 
     // The first entry for this program. Two containers can hold the same FSSM program with different input
     // signatures; `candidates` returns all of them.
@@ -880,6 +882,7 @@ private:
             fspx_entries_.clear();
             count_ = 0;
             fspx_count_ = 0;
+            bvh_count_ = 0;
         }
         for (const auto& [name, meta] : root.object) {
             const Json* hash = meta.find("fssm_sha256");
@@ -943,7 +946,8 @@ private:
             e.max_primitives = u32(meta.find("max_primitives"));
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
-            if (by_fspx && (prefix == "fspx/" || prefix == "library/")) ++fspx_count_;
+            if (by_fspx && prefix == "fspx/") ++fspx_count_;
+            if (prefix == "bvh/") ++bvh_count_;
             ++count_;
         }
         return true;
@@ -952,6 +956,7 @@ private:
     std::filesystem::path dir_;
     std::size_t count_ = 0;
     std::size_t fspx_count_ = 0;
+    std::size_t bvh_count_ = 0;
     // Entries by (stage, fssm_sha256) and by (stage, fspx_code_sha256), in index order.
     Entries entries_;
     Entries fspx_entries_;

@@ -66,11 +66,6 @@ struct BundledModuleOps {
     void* (*load_bundled)(void* ctx, const std::string& dll_lower, uint32_t flags, bool& handled);
     void* (*get_proc)(void* ctx, void* module, const std::string& sym, bool& owns_handle);
     bool (*owns_handle)(void* ctx, void* module);
-    // The handle of the first image the loader mapped (the exe), for GetModuleHandle(nullptr). Null if none.
-    void* (*main_module)(void* ctx);
-    // The path a mapped module was loaded from, for GetModuleFileName: `module` nullptr asks for the main image,
-    // a handle asks for that module; null when the handle is not the loader's (or it has no main image).
-    const std::filesystem::path* (*module_path)(void* ctx, void* module);
     // The same two lookups by the module's native (wide) basename, for names the ANSI code page cannot spell
     // (library_loader's W entries use them when a name has a character outside ASCII). Either may be null.
     void* (*find_loaded_w)(void* ctx, const std::wstring& basename);

@@ -51,6 +51,24 @@ std::string narrow_module_key(const std::filesystem::path& path) {
     return {};
 }
 
+// Windows matches module names case-insensitively with its own upcase table (RtlEqualUnicodeString); the
+// ordinal ignore-case compare is that table.
+bool same_module_name(const wchar_t* a, const wchar_t* b) {
+    return CompareStringOrdinal(a, -1, b, -1, TRUE) == CSTR_EQUAL;
+}
+
+// A narrow (ANSI code page) module name widened for a case-insensitive compare; empty when it is not valid in the
+// code page.
+std::wstring acp_to_wide(const std::string& narrow) {
+    if (narrow.empty()) return {};
+    const int n = MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, narrow.data(), static_cast<int>(narrow.size()),
+                                      nullptr, 0);
+    if (n <= 0) return {};
+    std::wstring wide(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, narrow.data(), static_cast<int>(narrow.size()), wide.data(), n);
+    return wide;
+}
+
 std::string path_utf8(const std::filesystem::path& path) {
     const auto bytes = path.u8string();
     return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
@@ -989,14 +1007,6 @@ bool bundled_owns_handle(void* ctx, void* module) {
     return static_cast<Loader*>(ctx)->owns_module_handle(module);
 }
 
-void* bundled_main_module(void* ctx) {
-    return static_cast<Loader*>(ctx)->main_module();
-}
-
-const std::filesystem::path* bundled_module_path(void* ctx, void* module) {
-    return static_cast<Loader*>(ctx)->module_path_for(module);
-}
-
 void* bundled_find_loaded_w(void* ctx, const std::wstring& basename) {
     return static_cast<Loader*>(ctx)->find_loaded_module_w(basename);
 }
@@ -1010,8 +1020,6 @@ const shims::BundledModuleOps kBundledOps{
     &bundled_load,
     &bundled_get_proc,
     &bundled_owns_handle,
-    &bundled_main_module,
-    &bundled_module_path,
     &bundled_find_loaded_w,
     &bundled_load_w,
 };
@@ -1091,6 +1099,7 @@ Module& Loader::load(const std::filesystem::path& image) {
     Module* mapped = nullptr;
     try {
         mapped = &map_image(image, narrow_key);
+        mapped->dynamic_load = runtime_loads_ > 0;  // before bind_imports: its dependencies are marked the same way
         bind_imports(*mapped);  // loads every bundled module m imports first, so they land in init_order_ before m
         protect_sections(*mapped);
         register_unwind(*mapped);
@@ -1112,11 +1121,33 @@ Module& Loader::load(const std::filesystem::path& image) {
 
 Module* Loader::find_narrow_module(const std::string& dll_lower) const {
     if (dll_lower.empty()) return nullptr;
-    // library_loader and PE import names keep their existing narrow-byte contract. Do not reinterpret them
-    // as UTF-8 or widen already-folded bytes (which could be part of a multibyte code-page character).
+    // library_loader and PE import names keep their existing narrow-byte contract: the exact compare below is
+    // bytewise, and the key is never reinterpreted as UTF-8.
     for (const auto& entry : by_name_)
         if (entry.second->narrow_key == dll_lower) return entry.second;
+    // The key is ASCII case-folded only. A name with letters outside ASCII (Cyrillic in code page 1251, say)
+    // compares case-insensitively through the code page, as GetModuleHandleA does: GUEST_ДА.EXE finds guest_да.exe.
+    // Widening the folded key is safe here: rt::lower() folds ASCII letters only, and no ANSI code page's multibyte
+    // sequences contain ASCII letter bytes, so both sides widen to the same characters they were spelt with.
+    if (const std::wstring wide = acp_to_wide(dll_lower); !wide.empty())
+        for (const auto& entry : by_name_)
+            if (!entry.second->narrow_key.empty() &&
+                same_module_name(acp_to_wide(entry.second->narrow_key).c_str(), wide.c_str()))
+                return entry.second;
     return nullptr;
+}
+
+Module* Loader::find_wide_module(const std::wstring& basename) const {
+    if (basename.empty()) return nullptr;
+    for (const auto& entry : by_name_)
+        if (same_module_name(entry.first.c_str(), basename.c_str())) return entry.second;
+    return nullptr;
+}
+
+void* Loader::find_loaded_module_w(const std::wstring& basename) const {
+    std::lock_guard lock(mutex_);
+    Module* m = find_wide_module(basename);
+    return m ? static_cast<void*>(m->base) : nullptr;
 }
 
 void* Loader::find_loaded_module(const std::string& dll_lower) const {
@@ -1130,6 +1161,7 @@ void* Loader::load_runtime_module(const std::string& dll_lower, uint32_t flags, 
     if (dll_lower.empty() || prefer_host_copy(dll_lower)) return nullptr;
 
     std::lock_guard lock(mutex_);
+    const RuntimeLoadScope dynamic(runtime_loads_);
     Module* existing = find_narrow_module(dll_lower);
     const std::filesystem::path candidate = game_dir_ / dll_lower;
     std::error_code ec;
@@ -1191,7 +1223,7 @@ void* Loader::load_runtime_candidate(Module* existing, const std::filesystem::pa
         // load() drops a module that failed to map or bind (dependencies included); this also drops one whose
         // initialise() failed, so later GetModuleHandle/LoadLibrary calls don't see it. ~Loader frees it via order_.
         by_name_.erase(module_key(mapped ? mapped->path : candidate));
-        std::fprintf(stderr, "[rt] loader: run-time load of %s failed: %s\n", dll_lower.c_str(), e.what());
+        std::fprintf(stderr, "[rt] loader: run-time load of %s failed: %s\n", display.c_str(), e.what());
         SetLastError(ERROR_DLL_INIT_FAILED);
         return nullptr;
     }
@@ -1213,6 +1245,7 @@ void* Loader::resolve_module_export(void* module_handle, const std::string& sym,
     if (auto it = target->exports.find(sym); it != target->exports.end()) return it->second;
     if (auto it = target->forwarders.find(sym); it != target->forwarders.end()) {
         try {
+            const RuntimeLoadScope dynamic(runtime_loads_);
             Binding binding = Binding::Unimplemented;
             void* fn = resolve_forwarder(it->second, binding, 0);
             if (binding == Binding::Module) initialise();
@@ -1312,7 +1345,11 @@ void Loader::initialise(Module& m) {
     auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
     if ((nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && m.entry_rva) {
         auto entry = reinterpret_cast<BOOL(NTAPI*)(void*, DWORD, void*)>(m.base + m.entry_rva);
-        const BOOL ok = entry(m.base, DLL_PROCESS_ATTACH, nullptr);
+        // lpvReserved "is NULL for dynamic loads and non-NULL for static loads" (DllMain docs). What Windows points
+        // it at is its own; a static load gets a CONTEXT captured here, so a DLL that reads through it reads memory.
+        CONTEXT context{};
+        if (!m.dynamic_load) RtlCaptureContext(&context);
+        const BOOL ok = entry(m.base, DLL_PROCESS_ATTACH, m.dynamic_load ? nullptr : &context);
         if (startup_trace::enabled())
             startup_trace::event("dllmain", "\"module\":" + startup_trace::quote(m.name) +
                                                 ",\"result\":" + std::to_string(ok));
