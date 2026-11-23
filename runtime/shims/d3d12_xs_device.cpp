@@ -2129,10 +2129,6 @@ HRESULT proxy_create_compute_pipeline_state(DeviceProxy* self, const D3D12_COMPU
 // does; they record on a second command list of the title's context. So type 105 is taken as a dispatch whose
 // arguments are a D3D12_DISPATCH_ARGUMENTS. HYPOTHESIS: what the console does differently for it (which command
 // stream it feeds) is not known; the PC layer has one compute path. Other descriptions are forwarded unchanged.
-//
-// The retail title's signature IID is the PC ID3D12CommandSignature IID
-// {c36a797c-ec80-4f0a-8985-a7b2475082d1}, so it is passed through. A null output goes to the real device: its
-// answer is the one Windows gives (E_UNEXPECTED), and the validation suite compares it.
 // 105 is outside D3D12_INDIRECT_ARGUMENT_TYPE's range, so the field is read as its 32 bits (a constant expression that
 // casts 105 to the enum does not compile with clang-cl).
 constexpr std::uint32_t kXboxIndirectArgumentDispatch105 = 105;
@@ -2146,66 +2142,33 @@ std::uint32_t argument_type(const D3D12_INDIRECT_ARGUMENT_DESC& arg) {
 HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SIGNATURE_DESC* desc,
                                        std::uint64_t root_signature, const IID* riid, void** out) {
     note_slot(41);
-    if (out) *out = nullptr;
-    if (!riid) return E_POINTER;
-    auto* const root = reinterpret_cast<ID3D12RootSignature*>(root_signature);
-
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMMAND_SIGNATURE_DESC*, std::uint64_t,
+                                           const IID*, void**);
+    const auto forward = reinterpret_cast<Fn>(self->real_vtable[41]);
     bool console = false;
     if (desc && desc->pArgumentDescs)
         for (UINT i = 0; i < desc->NumArgumentDescs && !console; ++i)
             console = argument_type(desc->pArgumentDescs[i]) == kXboxIndirectArgumentDispatch105;
+    if (!console) return forward(self->real, desc, root_signature, riid, out);
 
-    std::unique_ptr<D3D12_INDIRECT_ARGUMENT_DESC[]> args;
-    D3D12_COMMAND_SIGNATURE_DESC pc{};
-    const D3D12_COMMAND_SIGNATURE_DESC* pass = desc;
-    if (console) {
-        args.reset(new (std::nothrow) D3D12_INDIRECT_ARGUMENT_DESC[desc->NumArgumentDescs]);
-        if (!args) return E_OUTOFMEMORY;
-        for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
-            args[i] = desc->pArgumentDescs[i];
-            if (argument_type(args[i]) == kXboxIndirectArgumentDispatch105)
-                args[i].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
-        }
-        static std::atomic<bool> logged{false};
-        if (!logged.exchange(true, std::memory_order_relaxed))
-            std::fprintf(stderr, "[rt] d3d12_xs: slot 41 argument type 105 (stride %u) created as DISPATCH\n",
-                         desc->ByteStride);
-        pc = *desc;
-        pc.pArgumentDescs = args.get();
-        pass = &pc;
+    std::unique_ptr<D3D12_INDIRECT_ARGUMENT_DESC[]> args(new (std::nothrow)
+                                                             D3D12_INDIRECT_ARGUMENT_DESC[desc->NumArgumentDescs]);
+    if (!args) {
+        if (out) *out = nullptr;
+        return E_OUTOFMEMORY;
     }
-
-#pragma warning(suppress : 6387)
-    if (!out) return self->real->CreateCommandSignature(pass, root, *riid, nullptr);
-    const HRESULT hr = self->real->CreateCommandSignature(pass, root, *riid, out);
-    static std::atomic<bool> logged_console_iid{false};
-    if (!logged_console_iid.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr, "[rt] d3d12_xs: device slot 41 CreateCommandSignature desc=%p root=%p -> 0x%08lx\n",
-                     reinterpret_cast<const void*>(desc), reinterpret_cast<void*>(root),
-                     static_cast<unsigned long>(hr));
+    for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
+        args[i] = desc->pArgumentDescs[i];
+        if (argument_type(args[i]) == kXboxIndirectArgumentDispatch105)
+            args[i].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
     }
-    return hr;
-}
-
-// The Xbox slot 61 is CreateSamplerX(desc, dest): a sampler written to a CPU descriptor handle, with the PC
-// CreateSampler's two arguments. Measured on the retail title's boot (stop 20 in #6910's RT-5 measurements): the
-// title calls it once per sampler after its descriptor heaps exist, and it goes on when the call is served by the PC
-// CreateSampler. The PC slot 61 is CreateMetaCommand, which would take these words as (CommandId, NodeMask, ...).
-// HYPOTHESIS: the console description begins with the PC D3D12_SAMPLER_DESC (52 bytes), which is what got the title
-// past this call; whatever follows it is not known and not read. The title was not seen testing a result, so a null
-// description is skipped rather than reported. The handle is passed as given: a handle in the title's own heap range
-// is #7021's translation.
-void proxy_create_sampler_x(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, std::uint64_t dest) {
-    note_slot(61);
-    if (!desc) {
-        static std::atomic<bool> logged{false};
-        if (!logged.exchange(true, std::memory_order_relaxed))
-            std::fprintf(stderr, "[rt] d3d12_xs: slot 61 CreateSamplerX without a description (skipped)\n");
-        return;
-    }
-    D3D12_CPU_DESCRIPTOR_HANDLE handle{};
-    handle.ptr = static_cast<SIZE_T>(dest);
-    self->real->CreateSampler(desc, handle);
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 41 argument type 105 (stride %u) created as DISPATCH\n",
+                     desc->ByteStride);
+    D3D12_COMMAND_SIGNATURE_DESC pc = *desc;
+    pc.pArgumentDescs = args.get();
+    return forward(self->real, &pc, root_signature, riid, out);
 }
 
 // The Xbox slot 67 creates a compute pipeline from native GPU code: (desc, riid, out), named
@@ -2792,9 +2755,6 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_command_signature(
             self, reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(a1), a2, reinterpret_cast<const IID*>(a3),
             reinterpret_cast<void**>(a4)));
-    } else if constexpr (Slot == 61) {
-        proxy_create_sampler_x(self, reinterpret_cast<const D3D12_SAMPLER_DESC*>(a1), a2);
-        return 0;
     } else if constexpr (Slot == 67) {
         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
             self, reinterpret_cast<const void*>(a1), reinterpret_cast<const IID*>(a2),
@@ -3235,7 +3195,7 @@ std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* devic
 
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 14 || slot == 31 || slot == 32 || slot == 34 || slot == 35 ||
-        slot == 36 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
+        slot == 36 || slot == 41 || slot == 45 || slot == 46 || slot == 50 || slot == 62 || slot == 67 ||
         slot == 75 || slot == 76)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();

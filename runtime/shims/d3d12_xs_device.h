@@ -1,17 +1,8 @@
 // Xbox-ABI proxy around a PC ID3D12Device.
 //
 // Measured Xbox device deviations used here (vtable indices, x64):
-//   slot 26   GetCustomHeapProperties, the PC slot, but the retail executable calls it with the buffer for the
-//             returned struct in RCX and the device in RDX (node mask in R8, heap type in R9; three calls with node
-//             mask 1 and types DEFAULT/UPLOAD/READBACK). A PC C++ method has the device in RCX and the buffer in RDX.
-//             The thunk takes the console form when RDX holds a device proxy and forwards the PC form otherwise.
-//             Slots 25 and 43 return structs too and are still forwarded in the PC form: the executable calls 25 the
-//             same way (#6982 and its own call site), with console resource descriptions the PC method cannot take as
-//             they are, and no call of 43 has been seen.
 //   slot 41   CreateCommandSignature at its PC position; a console argument of type 105 (a 12-byte dispatch, read
 //             from the retail title's call sites) is created as D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.
-//   slot 61   CreateSamplerX(desc, dest) -> PC CreateSampler (slot 22); the description's PC
-//             D3D12_SAMPLER_DESC prefix is passed. The PC slot 61 is CreateMetaCommand. Measured on the retail title's boot.
 //   slot 62   CreateComputePipelineState(desc, w2, w3, iid, out): two words (0 from XboxBvhBuilder, meaning unknown)
 //             before the IID. The PC slot 62 is CreateStateObject.
 //   slot 67   CreateComputePipelineState from native code (desc, iid, out): converts the Xbox native-code desc
