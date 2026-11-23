@@ -1,0 +1,23 @@
+name: Build Runtime
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Configure
+        shell: pwsh
+        run: cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLEONIDA_SDL3_FETCH=ON -DLEONIDA_VULKAN_HEADERS_FETCH=ON -DLEONIDA_SDL3_FETCH=ON -DLEONIDA_VULKAN_HEADERS_FETCH=ON
+      - name: Build gta6rt
+        shell: pwsh
+        run: cmake --build runtime/build --target gta6rt gta6rt_tls_host
+      - name: Publish release asset
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Compress-Archive -Path runtime/build/gta6rt.exe,runtime/build/gta6rt_tls_host.dll -DestinationPath runtime-windows.zip -Force
+          gh release create "ci-${{ github.run_id }}" runtime-windows.zip --repo "${{ github.repository }}" --title "CI ${{ github.run_id }}" --notes "gta6rt runtime build"

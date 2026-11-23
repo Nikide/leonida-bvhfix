@@ -162,6 +162,7 @@ unsigned device_proxy_slot_count(const void* device);
 // The PC device behind a proxy. Null when `device` is not a proxy.
 ID3D12Device* device_proxy_real_device(const void* device);
 
+<<<<<<< ours
 // The device's frame-token counter, shared with the presentation pacer when one is attached: device slot 80
 // (WaitFrameEventX) hands out its tokens and PresentX checks them, so a title that waits through the device and
 // presents through its XboxPresentation never sees a token the pacer did not issue. Null for a non-proxy.
@@ -200,6 +201,12 @@ using XboxPresentationFactory = XboxPresentationSink* (*)(ID3D12Device* real, vo
 void set_xbox_presentation_factory(XboxPresentationFactory factory);
 // Optional window for this device's factory (an HWND as std::uint64_t); null lets the factory discover it.
 void set_device_presentation_window(void* device, std::uint64_t window);
+=======
+// The real object behind any of the child proxies (heap, queue, fence, allocator, and a kind added later, such as a
+// console command-list proxy, which joins proxy_real_object), or null when `object` is none of them. For code outside
+// this file that is handed a title's object, like the XboxBvhBuilder shim's command lists.
+IUnknown* real_object_behind_proxy(const void* object);
+>>>>>>> theirs
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 13 (console-sized D3D12_OPTIONS), 14 (descriptor heap proxy), 17-24 (CPU
