@@ -33,6 +33,9 @@
 #include "cpu_emulation.h"
 #include "mods.h"
 #include "pe_loader.h"
+
+namespace rt::shims { std::size_t xbox_bvh_builder_live_count(); }
+static volatile std::size_t g_xbox_bvh_builder_link = rt::shims::xbox_bvh_builder_live_count();
 #include "../shims/d3d12_trace.h"
 #include "../shims/file_system.h"
 #include "../shims/process_shim.h"
