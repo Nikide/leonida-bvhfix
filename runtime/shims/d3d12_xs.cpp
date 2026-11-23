@@ -314,15 +314,10 @@ static_assert(std::is_same_v<decltype(&serialize_root_signature), SerializeFn>);
 static_assert(std::is_same_v<decltype(&create_root_signature_deserializer), DeserializerFn>);
 static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacySerializeFn>);
 
-// The runtime's 93 GUID data exports (docs/d3d12_xs_surface.md section 2.2): 83 the Windows SDK also defines, with
-// the same bytes, and 10 console-only ones. A title linked against the console import library imports them as data,
-// so the import address table slot holds the address of the GUID itself; an import nobody serves is bound to the
-// unimplemented-import thunk, and the title would read that thunk's code as its interface id without ever calling
-// it. The values come from tools/d3d12_xs_surface.py, which checks the standard ones against the SDK headers.
-#define LEONIDA_D3D12_XS_GUID(name, d1, d2, d3, b0, b1, b2, b3, b4, b5, b6, b7) \
-    const GUID kExport_##name = {d1, d2, d3, {b0, b1, b2, b3, b4, b5, b6, b7}};
-#include "d3d12_xs_guids.inc"
-#undef LEONIDA_D3D12_XS_GUID
+// Measured call (RT-5, 1.0.2.1): the title calls it once at startup with one pointer to a zeroed 32-byte block whose
+// dword at +4 it sets (a count), and only checks the result for failure. The PC/Vulkan side owns virtual memory,
+// so the policy is accepted and ignored.
+HRESULT WINAPI configure_virtual_memory(void* /*desc*/) { return S_OK; }
 
 }  // namespace
 
@@ -353,5 +348,5 @@ SHIM_TABLE(d3d12_xs,
     {"d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer",
      reinterpret_cast<void*>(&create_root_signature_deserializer)},
     {"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&D3D12XboxCreateDevice)},
-    {"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", reinterpret_cast<void*>(&D3D12ConfigureVirtualMemoryX)},
+    {"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", reinterpret_cast<void*>(&configure_virtual_memory)},
 );

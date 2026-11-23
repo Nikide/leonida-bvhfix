@@ -587,7 +587,9 @@ enum class IndirectKind : std::uint8_t {
     draw = 0,
     draw_indexed = 1,
     dispatch = 2,
-    dispatch_mesh = 3,  // D3D12_DISPATCH_MESH_ARGUMENTS, the same 12 bytes as VkDrawMeshTasksIndirectCommandEXT
+    // D3D12_DISPATCH_MESH_ARGUMENTS. Created on a device with mesh shaders; ExecuteIndirect with it records nothing
+    // yet (the replay is #3777's), so a title that only creates such a signature at startup goes on.
+    dispatch_mesh = 3,
 };
 
 struct ExecuteIndirect {
@@ -898,9 +900,6 @@ public:
         if (indirect.argument_offset % 4) return false;
         if (!indirect.count_buffer && indirect.count_offset) return false;
         if (indirect.count_buffer && indirect.count_offset % 4) return false;
-        if (indirect.state && (!indirect.state->pipeline || indirect.kind == IndirectKind::dispatch)) return false;
-        // A mesh dispatch carries DispatchMesh's state, a draw kind a draw's.
-        if (indirect.state && indirect.state->mesh != (indirect.kind == IndirectKind::dispatch_mesh)) return false;
         if (!indirect.max_count) return !closed_;  // the PC runtime takes MaxCommandCount 0 as a no-op
         return append(indirect);
     }

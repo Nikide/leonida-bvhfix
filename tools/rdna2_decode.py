@@ -16,6 +16,8 @@ import json
 import os
 import struct
 import sys
+from collections.abc import Iterator
+from io import StringIO
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -139,7 +141,7 @@ _SOPP_BRANCHES = frozenset({
 
 # SOPP instructions that take no operand at all.
 _SOPP_NO_OPERAND = frozenset({
-    "s_endpgm", "s_barrier", "s_icache_inv", "s_ttracedata", "s_ttracedata_imm",
+    "s_endpgm", "s_barrier", "s_icache_inv", "s_ttracedata",
     "s_wakeup", "s_endpgm_saved", "s_code_end", "s_endpgm_ordered_ps_done",
 })
 
@@ -1347,7 +1349,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
     return None, 4
 
 
-def _format_operand(a: dict) -> str:
+def _format_operand(a: dict, hex_imm: bool = False) -> str:
     k = a["k"]
     if k in ("vgpr", "sgpr"):
         p = "v" if k == "vgpr" else "s"
@@ -1363,7 +1365,7 @@ def _format_operand(a: dict) -> str:
         s = a["t"]
     elif k == "imm":
         v = a["v"]
-        s = f"0x{v:x}" if v >= 100 else str(v)
+        s = f"0x{v:x}" if hex_imm or v >= 100 else str(v)
     elif k == "fimm":
         v = a["v"]
         s = next((txt for code, txt in _INLINE_FLOAT_STR.items() if _INLINE_FLOAT[code] == v), repr(v))
@@ -1387,10 +1389,12 @@ def format_insn(ins: dict) -> str:
     op = ins["op"]
     args = ins["args"]
     mods = ins["mods"]
+    hex_imm = op == "s_ttracedata_imm"
     if op == "exp" and args:
-        head = f"{op} {_format_operand(args[0])} " + ", ".join(_format_operand(x) for x in args[1:])
+        head = f"{op} {_format_operand(args[0], hex_imm)} " + ", ".join(
+            _format_operand(x, hex_imm) for x in args[1:])
     elif args:
-        head = f"{op} " + ", ".join(_format_operand(x) for x in args)
+        head = f"{op} " + ", ".join(_format_operand(x, hex_imm) for x in args)
     else:
         head = op
     if mods:
@@ -1400,25 +1404,41 @@ def format_insn(ins: dict) -> str:
     return f"\t{head:<40s}; encoding: [{enc_str}]"
 
 
-def decode_bytes(code: bytes, *, mcpu: str = "gfx1013", wave32: bool = True, code_start: int = 0, name: str = "") -> dict:
-    """Decode raw RDNA2 machine code into the exact dict layout `shader_ir.parse_file()` returns."""
-    insns = []
-    invalid = 0
+def _iter_insns(code: bytes, wave32: bool, code_start: int, mcpu: str) -> Iterator[dict | None]:
+    """Yield each decoded instruction, or None for each invalid word counted."""
     off = 0
     while off < len(code):
         ins, nbytes = _decode_one(code, off, wave32, mcpu)
         if ins is None:
-            invalid += 1
             off += max(4, nbytes)
-            continue
-        ins["pc"] = code_start + off
-        insns.append(ins)
-        off += nbytes
+        else:
+            ins["pc"] = code_start + off
+            off += nbytes
+        yield ins
+
+
+def decode_bytes(code: bytes, *, mcpu: str = "gfx1013", wave32: bool = True, code_start: int = 0, name: str = "") -> dict:
+    """Decode raw RDNA2 machine code into the exact dict layout `shader_ir.parse_file()` returns."""
+    insns = []
+    invalid = 0
+    for ins in _iter_insns(code, wave32, code_start, mcpu):
+        if ins is None:
+            invalid += 1
+        else:
+            insns.append(ins)
     return {"name": name, "code_start": code_start, "insns": insns, "invalid": invalid}
 
 
 def disasm_bytes(code: bytes, *, mcpu: str = "gfx1013", wave32: bool = True, code_start: int = 0, name: str = "") -> tuple[str, int]:
-    """Decode raw RDNA2 machine code into `(llvm_compatible_text, invalid_word_count)`."""
-    info = decode_bytes(code, mcpu=mcpu, wave32=wave32, code_start=code_start, name=name)
-    lines = [format_insn(ins) for ins in info["insns"]]
-    return "\n".join(lines) + ("\n" if lines else ""), info["invalid"]
+    """Decode raw RDNA2 machine code into `(llvm_compatible_text, invalid_word_count)`.
+
+    The listing contains only instructions. `name` is accepted for caller compatibility.
+    """
+    invalid = 0
+    with StringIO() as listing:
+        for ins in _iter_insns(code, wave32, code_start, mcpu):
+            if ins is None:
+                invalid += 1
+            else:
+                listing.write(f"{format_insn(ins)}\n")
+        return listing.getvalue(), invalid

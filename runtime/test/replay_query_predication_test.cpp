@@ -6,8 +6,8 @@
 // and their no-pool fallback (D3D-162). Cases 9 to 13 check overlapping queries: statistics over statistics, binary
 // inside ordinary, the composite sum-and-normalize binary resolve, helper dispatches inside overlapping statistics
 // queries, the single-list refusal (D3D-252) and, with a pool, its replay (D3D-399). Cases 15 and 16 check queries
-// that hold mesh draws, split between the full and the mesh-compatible pool, alone and overlapping (D3D-291).
-// Case 17 checks that the counted indirect dispatch helper runs between statistics segments. No GPU or game data.
+// that hold mesh draws, split between the full and the mesh-compatible pool, alone and overlapping (D3D-291). No GPU or
+// game data.
 #include "../src/vulkan_replay.h"
 #include <cstdint>
 #include <cstdio>
@@ -127,8 +127,8 @@ int main() {
     vk.query_pool = [&](QueryHeapId id) -> QueryPool* {
         return id == 1 ? &heap : id == 6 ? &statistics_heap : nullptr;
     };
-    vk.sum_statistics = [](VkCommandBuffer, VkQueryPool pool, std::uint32_t first, std::uint32_t count, VkBuffer,
-                           VkDeviceSize) {
+    vk.sum_statistics = [](VkCommandBuffer, VkQueryPool pool, VkQueryPool, const std::uint8_t*, std::uint32_t first,
+                           std::uint32_t count, VkBuffer, VkDeviceSize) {
         g_trace->events.push_back(query_event("sum_statistics", pool, first) + "+" + std::to_string(count));
     };
     vk.resolve_binary_occlusion = [](VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t, VkBuffer,
@@ -753,60 +753,6 @@ int main() {
         // queries[] follows the commands: Begin 0, Begin 1, End 0, End 1.
         expect(q[2].statistics_first == 0 && q[2].statistics_count == 2, "overlap-mesh: query 0 sums segments 0-1");
         expect(q[3].statistics_first == 1 && q[3].statistics_count == 3, "overlap-mesh: query 1 sums segments 1-3");
-    }
-
-    // 17. A counted indirect dispatch's helper must run outside the statistics query, while the application's
-    //     indirect dispatch runs inside the resumed segment.
-    {
-        Trace trace;
-        g_trace = &trace;
-        auto helpers = vk;
-        const ComputePipeline pipeline{handle<VkPipeline>(12), handle<VkPipelineLayout>(13)};
-        helpers.compute_pipeline = [&](std::uintptr_t) -> const ComputePipeline* { return &pipeline; };
-        helpers.bind_pipeline = +[](VkCommandBuffer, VkPipelineBindPoint, VkPipeline) {};
-        helpers.push_constants = +[](VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, std::uint32_t,
-                                     std::uint32_t, const void*) {};
-        helpers.prepare_counted_dispatch = [](VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize, std::uint32_t,
-                                               std::uint32_t, CountedDispatch& out) {
-            out.indirect = handle<VkBuffer>(14);
-            return true;
-        };
-        helpers.emit_counted_dispatch = [](VkCommandBuffer, const CountedDispatch&) {
-            g_trace->events.push_back("count_dispatch");
-        };
-        helpers.dispatch_indirect = +[](VkCommandBuffer, VkBuffer, VkDeviceSize) {
-            g_trace->events.push_back("dispatch_indirect");
-        };
-
-        ExecuteIndirect indirect{};
-        indirect.kind = IndirectKind::dispatch;
-        indirect.stride = sizeof(VkDispatchIndirectCommand);
-        indirect.max_count = 1;
-        indirect.argument_buffer = 2;
-        indirect.count_buffer = 1;
-        indirect.pipeline = 12;
-        CommandList list;
-        expect(list.begin_query({6, d3d12_query::pipeline_statistics, 0}), "record counted dispatch query begin");
-        expect(list.execute_indirect(indirect), "record counted dispatch");
-        expect(list.end_query({6, d3d12_query::pipeline_statistics, 0}), "record counted dispatch query end");
-        expect(list.resolve_queries({6, d3d12_query::pipeline_statistics, 0, 1, 1, 0}), "record counted dispatch resolve");
-        expect(list.close(), "close counted dispatch list");
-
-        PreparedList prepared;
-        expect(prepare(list, resolve, helpers, prepared, true) == ReplayResult::success, "prepare counted dispatch list");
-        auto segments = std::make_shared<OcclusionSegmentPool>();
-        segments->pool = handle<VkQueryPool>(9);
-        segments->destroy = mock_destroy_pool;
-        QueryReplay queries;
-        const auto planned = queries.plan(prepared, {}, 0, true, segments, 0);
-        expect(planned == ReplayResult::success, "plan counted dispatch list");
-        if (planned == ReplayResult::success) {
-            emit(prepared, VK_NULL_HANDLE, helpers);
-            const std::vector<std::string> want{"begin_query 9:0", "end_query 9:0", "count_dispatch",
-                                                "begin_query 9:1", "dispatch_indirect", "end_query 9:1",
-                                                "sum_statistics 9:0+2"};
-            expect(trace.events == want, "counted dispatch: suspend and resume statistics once around the helper");
-        }
     }
 
     if (failures) return 1;

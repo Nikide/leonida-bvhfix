@@ -12,6 +12,8 @@
 //     bottom-left quadrant (yellow). Each pixel is read back and compared.
 //   - A vertex draw with the mesh PSO, and DispatchMesh with the VS one, fail at execution (ReplayResult::
 //     invalid_draw); a mesh grid beyond D3D12's limits fails at Close; an empty grid records nothing.
+//   - A DISPATCH_MESH command signature is created only with the extension; ExecuteIndirect with it records nothing
+//     yet, so its list closes.
 // The shaders are GLSL written to the translator's contract (test/glsl/ms_draw.mesh, ps_draw.frag, vs_fullscreen.vert).
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
@@ -138,6 +140,7 @@ int main() {
         info.buffer_device_address = true;
         info.shader_dir = library.string();
         info.mesh_shader = mesh;
+        info.pipeline_statistics_query = d.pipeline_statistics_query;
         return info;
     };
     const auto make_device = [&](bool mesh, Ref<ID3D12Device>& device) {
@@ -179,6 +182,11 @@ int main() {
         stream.add(TargetsSubobject{.inner = one_target()});
         Ref<ID3D12PipelineState> pso;
         EXPECT(create(device.p, stream, pso) == E_NOTIMPL && !pso.p);
+        // A DISPATCH_MESH command signature is refused the same way.
+        const D3D12_INDIRECT_ARGUMENT_DESC mesh_arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
+        const D3D12_COMMAND_SIGNATURE_DESC mesh_sig{12, 1, &mesh_arg, 0};
+        Ref<ID3D12CommandSignature> sig;
+        EXPECT(device->CreateCommandSignature(&mesh_sig, nullptr, IID_PPV_ARGS(&sig.p)) == E_NOTIMPL && !sig.p);
         root.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }
@@ -397,7 +405,103 @@ int main() {
         list->RSSetViewports(1, &viewport);
         list6->DispatchMesh(4096, 1025, 1);
         EXPECT(list->Close() == E_INVALIDARG);
+        // A DISPATCH_MESH command signature (D3D12_DISPATCH_MESH_ARGUMENTS, 12 bytes) is created; a stride below its
+        // 12 bytes is refused as the PC runtime refuses it. ExecuteIndirect with it records nothing yet (#3777 replays
+        // it), so the list still closes.
+        {
+            const D3D12_INDIRECT_ARGUMENT_DESC mesh_arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
+            const D3D12_COMMAND_SIGNATURE_DESC mesh_sig{12, 1, &mesh_arg, 0};
+            const D3D12_COMMAND_SIGNATURE_DESC short_sig{8, 1, &mesh_arg, 0};
+            Ref<ID3D12CommandSignature> sig, short_one;
+            EXPECT(SUCCEEDED(device->CreateCommandSignature(&mesh_sig, nullptr, IID_PPV_ARGS(&sig.p))) && sig.p);
+            EXPECT(device->CreateCommandSignature(&short_sig, nullptr, IID_PPV_ARGS(&short_one.p)) == E_INVALIDARG);
+            EXPECT(SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
+            list->SetGraphicsRootSignature(root.p);
+            list->ExecuteIndirect(sig.p, 1, upload.p, 0, nullptr, 0);
+            EXPECT(list->Close() == S_OK);
+        }
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 2)) && SUCCEEDED(fence->SetEventOnCompletion(2, nullptr)));
+
+        // D3D-291: pipeline statistics around mesh draws. Query 0 holds a vertex draw, two mesh draws and another
+        // vertex draw, which the layer splits into a full, a mesh and a full segment; query 1 holds one mesh draw;
+        // query 2 the two vertex draws alone. A mesh draw has no input assembly or vertex shader, so those fields
+        // count only the two full-screen triangles (3 vertices, 1 primitive each). How many clipping and pixel
+        // shader invocations a draw makes is the driver's (RADV's PSInvocations is not the pixel count), so query
+        // 0 is checked against query 2: more of both is the mesh segment's share. Under LEONIDA_VK_VALIDATION=1 the
+        // run must stay free of VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076.
+        if (d.pipeline_statistics_query) {
+            const D3D12_QUERY_HEAP_DESC statistics_desc{D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, 3, 0};
+            Ref<ID3D12QueryHeap> statistics;
+            EXPECT(SUCCEEDED(device->CreateQueryHeap(&statistics_desc, IID_PPV_ARGS(&statistics.p))));
+            Ref<ID3D12Resource> results;
+            const auto results_desc = buffer_desc(3 * sizeof(D3D12_QUERY_DATA_PIPELINE_STATISTICS));
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &results_desc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&results.p))));
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, mesh_pso.p)));
+            D3D12_RESOURCE_BARRIER back_to_target =
+                transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &back_to_target);
+            list->SetGraphicsRootSignature(root.p);
+            list->RSSetScissorRects(1, &scissor);
+            list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+            list->SetGraphicsRoot32BitConstants(0, 2, origin, 0);
+            list->SetGraphicsRootConstantBufferView(1, upload_va);
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            const auto vertex_draw = [&] {
+                list->SetPipelineState(vs_pso.p);
+                list->RSSetViewports(1, &bottom_left);
+                list->DrawInstanced(3, 1, 0, 0);
+            };
+            const auto mesh_draw = [&](UINT x, UINT y) {
+                list->SetPipelineState(mesh_pso.p);
+                list->RSSetViewports(1, &viewport);
+                list6->DispatchMesh(x, y, 1);
+            };
+            list->BeginQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+            vertex_draw();
+            mesh_draw(2, 2);
+            mesh_draw(1, 1);
+            vertex_draw();
+            list->EndQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0);
+            list->BeginQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 1);
+            mesh_draw(2, 2);
+            list->EndQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 1);
+            list->BeginQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 2);
+            vertex_draw();
+            vertex_draw();
+            list->EndQuery(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 2);
+            list->ResolveQueryData(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 3, results.p, 0);
+            EXPECT(list->Close() == S_OK);
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 3)) && SUCCEEDED(fence->SetEventOnCompletion(3, nullptr)));
+            D3D12_QUERY_DATA_PIPELINE_STATISTICS data[3]{};
+            void* stats_mapped = nullptr;
+            EXPECT(SUCCEEDED(results->Map(0, nullptr, &stats_mapped)));
+            std::memcpy(data, stats_mapped, sizeof(data));
+            results->Unmap(0, nullptr);
+            const auto& mixed = data[0];
+            const auto& mesh_only = data[1];
+            const auto& vertex_only = data[2];
+            std::printf("statistics, mixed: IA %llu/%llu VS %llu C %llu/%llu PS %llu CS %llu; mesh only: C %llu/%llu "
+                        "PS %llu; vertex only: C %llu PS %llu\n",
+                        mixed.IAVertices, mixed.IAPrimitives, mixed.VSInvocations, mixed.CInvocations,
+                        mixed.CPrimitives, mixed.PSInvocations, mixed.CSInvocations, mesh_only.CInvocations,
+                        mesh_only.CPrimitives, mesh_only.PSInvocations, vertex_only.CInvocations,
+                        vertex_only.PSInvocations);
+            EXPECT(mixed.IAVertices == 6 && mixed.IAPrimitives == 2 && mixed.VSInvocations >= 1);
+            EXPECT(vertex_only.IAVertices == 6 && vertex_only.IAPrimitives == 2);
+            EXPECT(mixed.GSInvocations == 0 && mixed.GSPrimitives == 0 && mixed.HSInvocations == 0 &&
+                   mixed.DSInvocations == 0 && mixed.CSInvocations == 0);
+            EXPECT(mixed.CInvocations > vertex_only.CInvocations && mixed.PSInvocations > vertex_only.PSInvocations);
+            EXPECT(mesh_only.IAVertices == 0 && mesh_only.IAPrimitives == 0 && mesh_only.VSInvocations == 0 &&
+                   mesh_only.GSInvocations == 0 && mesh_only.GSPrimitives == 0 && mesh_only.HSInvocations == 0 &&
+                   mesh_only.DSInvocations == 0 && mesh_only.CSInvocations == 0);
+            EXPECT(mesh_only.CInvocations > 0 && mesh_only.PSInvocations > 0);
+        } else {
+            std::printf("pipelineStatisticsQuery not available: the D3D-291 statistics check is skipped\n");
+        }
 
         for (auto* r : {&upload, &readback, &target}) r->reset();
         for (auto* p : {&mesh_pso, &vs_pso, &refused}) p->reset();
@@ -435,7 +539,7 @@ int main() {
     }
     std::printf("D3D-29: mesh tier 1; mesh and VS PSOs from pipeline state streams (9 refused as invalid, 2 as not "
                 "implemented); DispatchMesh over X, Y and Z and a stream VS draw matched all %u pixels; wrong-kind "
-                "draws fail at execution, oversized grids at Close\n",
+                "draws fail at execution, oversized grids at Close; statistics queries around mesh draws resolve\n",
                 size * size);
     return 0;
 }

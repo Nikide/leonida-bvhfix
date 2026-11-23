@@ -209,10 +209,8 @@ struct VulkanDeviceInfo {
 // the device and every object it created. Wrap it in rt::d3d12_xs::create_device_proxy for the Xbox ABI.
 HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** out);
 
-// The same, on a Vulkan device of its own (destroyed with the D3D12 device), made on the process's one Vulkan
-// instance: the first call creates it and it is kept until the process ends, so hooks that cached its handles stay
-// valid (#5144). Picks the first discrete GPU with the features above. LEONIDA_VK_VALIDATION=1 (read by the first
-// call) enables VK_LAYER_KHRONOS_validation.
+// The same, on a Vulkan instance and device of its own (destroyed with the D3D12 device). Picks the first discrete
+// GPU with the features above. LEONIDA_VK_VALIDATION=1 enables VK_LAYER_KHRONOS_validation.
 //
 // The queue test settings (LEONIDA_VK_MAX_QUEUES_PER_FAMILY, LEONIDA_VK_GRAPHICS_FAMILY_ONLY; docs/testing.md) give
 // the device fewer Vulkan queues than the GPU has, so the tests run the path where D3D12 queues share one. Only the

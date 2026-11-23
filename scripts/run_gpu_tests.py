@@ -27,12 +27,13 @@ sys.path.insert(0, SHADER_DIR)
 from build import CLIP_CASES, clip_container, shader_source
 from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_narrow_test, fmt_sint32_test,
                    fmt_xy_xyz_test, tbuffer_store_test)
+from check import compute_unsupported   # vk_compute_test's exit 77 over a feature the module needs
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
 from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_LO_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
-                   pick_build_dir, start_failure, texture_gradient_a16_test, texture_mip_test)
-from check import SIGNED_MIP_TEST
+                   pick_build_dir, start_failure, table_fetch_test, texture_gradient_a16_test, texture_mip_test)
+from check import SIGNED_MIP_TEST, UINT_MIP_TEST
 from check import HEAP_INIT_EXPECTED, heap_init_env   # cs_heap_init: vk_compute_test's VKC_HEAP_INIT
 from check import judged_words, words_match   # dump words not judged on some devices (cs_signed_zero_nan)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
@@ -142,7 +143,25 @@ def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
         f.write("\n".join(lines) + "\n")
 
 
-def spirv_as(asm_text: str, out_spv: str) -> None:
+def resolve_assembler(choice: str) -> str:
+    """Resolve --assembler choice ('auto', 'spirv-as', or 'python') to a concrete assembler name."""
+    if choice in ("spirv-as", "python"):
+        return choice
+    if choice == "auto":
+        return "spirv-as" if shutil.which("spirv-as") else "python"
+    raise ValueError(f"unknown assembler: {choice!r}")
+
+
+def spirv_as(asm_text: str, out_spv: str, assembler: str = "spirv-as") -> None:
+    if assembler == "python":
+        import spirv_asm
+        try:
+            spv_bytes = spirv_asm.assemble(asm_text, target_env="vulkan1.2")
+        except spirv_asm.SpirvAsmError as exc:
+            raise RuntimeError(f"spirv_asm failed for {out_spv}:\n{exc}") from None
+        with open(out_spv, "wb") as f:
+            f.write(spv_bytes)
+        return
     p = subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-o", out_spv, "-"],
                        input=asm_text, capture_output=True, text=True)
     if p.returncode != 0:
@@ -269,6 +288,21 @@ def verdict_line(rc: int, msg: str) -> str:
     return failure(rc, msg, 1) if rc else msg.splitlines()[-1] if msg else ""
 
 
+def helper_result(rc: int, msg: str) -> tuple[bool | None, str]:
+    """(ok, detail) for a helper that judges its own output (vk_store_test): 77 is a SKIP that names the missing
+    feature, not a failure (TEST-469); otherwise the exit code decides and verdict_line gives the detail."""
+    if rc == UNSUPPORTED:
+        return None, unsupported_skip(msg)
+    return rc == 0, verdict_line(rc, msg)
+
+
+def compute_result(rc: int, msg: str, ok: bool, detail: str) -> tuple[bool | None, str]:
+    """(ok, detail) for a vk_compute_test run the caller judges itself, unless the module needs a feature the device
+    lacks (check.compute_unsupported: exit 77 with an "unsupported: ..." line), which is a SKIP quoting it."""
+    skip = compute_unsupported(rc, msg)
+    return (None, skip) if skip else (ok, detail)
+
+
 def run_cmd(cmd: list[str], env: dict | None = None, gpu: bool = True, *,
             cwd: str | None = None) -> tuple[int, str]:
     # A hung GPU test program fails its test instead of stalling the suite (check.py, LEONIDA_GPU_TEST_TIMEOUT).
@@ -335,6 +369,8 @@ def wavemask_check(vk_compute: str, spv: str, env: dict | None, emulated: bool) 
     --wave64-emulate and runs on any subgroup size, so it asks for none."""
     cmd = [vk_compute, spv, "1", "wavemask"] + ([] if emulated else ["--require-wave64"])
     rc, msg = run_cmd(cmd, env=env)
+    if skip := compute_unsupported(rc, msg):
+        return None, skip
     if not emulated and rc == 77:
         return None, "SKIP (no 64-wide compute subgroup on this device)"
     if not emulated and rc == 0 and "compute subgroup size: 64" not in msg.splitlines():
@@ -622,12 +658,12 @@ OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "vs_m15": "d3d12_transl
 # Shaders a selected test draws with, built even when the filter leaves them out (#192).
 DRAWN_WITH = {GATHER_LOD_TEST: "vs_ids.asm", "ps_flat": "vs_ids.asm", "ps_persp_bary": "vs_persp.asm", "ps_texture_sample": "vs_ids.asm", "ps_cube_sample": "vs_ids.asm",
               "ps_texture_sample_d16": "vs_ids.asm", "ps_sample_c_lz": "vs_ids.asm", "ps_sample_c_lz_a16": "vs_ids.asm",
-              "ps_sample_c": "vs_ids.asm", "ps_sample_c_b": "vs_ids.asm",
+              "ps_table_fetch": "vs_ids.asm", "ps_sample_c": "vs_ids.asm", "ps_sample_c_b": "vs_ids.asm",
               **{name: "vs_ids.asm" for name in TEXTURE_CONSTANTS}, "ps_ssharp": "vs_ids.asm", "ps_imgatomic": "vs_ids.asm",
               **{name: "vs_ids.asm" for name in GRADIENT_TESTS}, "vs_clip": "ps_clip_color.asm",
               "ps_interp_f16_high": "vs_f16_pack.asm", "ms_f16_pack": "ps_interp_f16_high.asm",
               "ps_interp_f32_mods": "vs_interp_consts.asm", "ps_interp_mov_mods": "vs_interp_consts.asm",
-              SIGNED_MIP_TEST: "vs_ids.asm",
+              SIGNED_MIP_TEST: "vs_ids.asm", UINT_MIP_TEST: "vs_ids.asm",
               "vs_base_ids": "ps_flat.asm"}
 DRAWN_WITH.update({name: "vs_ids.asm" for name in GET_LOD_TESTS})
 
@@ -698,12 +734,26 @@ def main() -> int:
     ap.add_argument("--work", default=None)
     ap.add_argument("--filter", default="")
     ap.add_argument("--require-pass", action="store_true", help="exit 1 if no GPU test passes")
+    ap.add_argument("--assembler", choices=("auto", "spirv-as", "python"), default="auto",
+                    help="SPIR-V assembler: auto (use spirv-as if on PATH, else tools/spirv_asm.py), "
+                         "spirv-as, or python")
+    ap.add_argument("--no-validate", action="store_true",
+                    help="skip spirv-val during translation (automatic when --assembler resolves to python "
+                         "and spirv-val is not on PATH)")
+    ap.add_argument("--disasm-dir", default=None,
+                    help="folder of pre-disassembled <name>.s listings (e.g. tests/semantic/fixtures/disasm); "
+                         "skips llvm-mc and runs only fixtures present there")
     a = ap.parse_args()
     # Some test programs run with their working directory in <work>/spirv (vk_texture_test), so a relative path
     # given here would point somewhere else for them.
     a.build = os.path.abspath(a.build)
     if a.work:
         a.work = os.path.abspath(a.work)
+    if a.disasm_dir is not None:
+        a.disasm_dir = os.path.abspath(a.disasm_dir)
+        if not os.path.isdir(a.disasm_dir):
+            print(f"error: --disasm-dir is not a directory: {a.disasm_dir}", file=sys.stderr)
+            return 2
 
     ext = ".exe" if os.name == "nt" else ""
     required = tuple(t + ext for t in TEST_PROGRAMS)
@@ -760,10 +810,24 @@ W64_GRAPHICS_ONLY = _w64_graphics_only()
 
 
 def run_suite(a, work: str) -> int:
+    assembler = resolve_assembler(getattr(a, "assembler", "auto"))
+    explicit_no_validate = bool(getattr(a, "no_validate", False))
+    no_validate = explicit_no_validate or (assembler == "python" and shutil.which("spirv-val") is None)
+    disasm_src = getattr(a, "disasm_dir", None)
+
     asm_files = sorted({f for f in os.listdir(SHADER_DIR) if f.endswith(".asm")} | {n + ".asm" for n in CLIP_CASES})
     # The wave64 pixel fixtures of runtime/test/shaders/w64_graphics.py (tiers A-C, #1541) are checked by that
     # runner, not here: they need a 64-wide fragment subgroup or the halves-aware lowering it drives.
     asm_files = [f for f in asm_files if f[:-4] not in W64_GRAPHICS_ONLY]
+    if disasm_src is not None:
+        available = {os.path.splitext(f)[0] for f in os.listdir(disasm_src) if f.endswith(".s")}
+        asm_files = [
+            f for f in asm_files
+            if all(os.path.splitext(p)[0] in available for p in with_draw_shaders([f]))
+        ]
+        if not asm_files:
+            print(f"error: --disasm-dir {disasm_src!r} matched no GPU test cases", file=sys.stderr)
+            return 2
     if a.filter:
         asm_files = [f for f in asm_files if a.filter in f]
         if not asm_files:
@@ -815,7 +879,10 @@ def run_suite(a, work: str) -> int:
                 f.write(compute_header(os.path.join(SHADER_DIR, fname)))
         fname = shader_source(name) + ".asm"
         disasm_path = os.path.join(disasm_dir, f"{name}.s")
-        assemble_to_s(a.llvm_mc, os.path.join(SHADER_DIR, fname), disasm_path, name)
+        if disasm_src is not None:
+            shutil.copyfile(os.path.join(disasm_src, f"{name}.s"), disasm_path)
+        else:
+            assemble_to_s(a.llvm_mc, os.path.join(SHADER_DIR, fname), disasm_path, name)
         disasm_files.append(disasm_path)
         # A failed translation must not run an old binary left in a reused --work directory.
         Path(spirv_dir, f"{name}.spv").unlink(missing_ok=True)
@@ -825,6 +892,12 @@ def run_suite(a, work: str) -> int:
         for path in disasm_files:
             shutil.copyfile(path, os.path.join(selected_disasm, os.path.basename(path)))
         cmd = [sys.executable, "-I", TRANSLATOR, selected_disasm, "--out", spirv_dir]
+        if assembler == "python":
+            cmd += ["--assembler", "python"]
+        if no_validate:
+            if not explicit_no_validate:
+                print("note: spirv-val not found on PATH; translating with --no-validate", flush=True)
+            cmd.append("--no-validate")
         if w64_emulated():   # wave64 compute/mesh exact on any subgroup size
             cmd.append("--wave64-emulate")
         if bary_fallback():   # raw barycentrics from an interpolated input, fed by a pass-through GS
@@ -858,9 +931,9 @@ def run_suite(a, work: str) -> int:
     vs_tri = os.path.join(spirv_dir, "vs_tri.spv")
     fs_passthru = os.path.join(spirv_dir, "fs_passthru.spv")
     fs_loc1 = os.path.join(spirv_dir, "fs_loc1.spv")
-    spirv_as(VS_TRI_SPVASM, vs_tri)
-    spirv_as(make_fs_passthru(0), fs_passthru)
-    spirv_as(make_fs_passthru(1), fs_loc1)
+    spirv_as(VS_TRI_SPVASM, vs_tri, assembler=assembler)
+    spirv_as(make_fs_passthru(0), fs_passthru, assembler=assembler)
+    spirv_as(make_fs_passthru(1), fs_loc1, assembler=assembler)
 
     index = {}
     idx_path = os.path.join(spirv_dir, "index.json")
@@ -896,16 +969,17 @@ def run_suite(a, work: str) -> int:
             results.append((name, None if isinstance(detail, Skip) else not detail, detail or "four pixel masks exact"))
         elif name == "cs_workgroup_yz":
             rc, msg = run_cmd([vk_compute, spv, "2x3x4", "workgroup_yz"], env=cs_env)
-            results.append((name, rc == 0 and "2x3x4 workgroup Y/Z: 0 mismatches" in msg.splitlines(), msg))
+            results.append((name,) + compute_result(rc, msg, rc == 0 and "2x3x4 workgroup Y/Z: 0 mismatches"
+                                                    in msg.splitlines(), msg))
         elif name == "cs_lds":
             rc, msg = run_cmd([vk_compute, spv, "4", "mirror64"], env=cs_env)
-            results.append((name, rc == 0, verdict_line(rc, msg)))
+            results.append((name,) + compute_result(rc, msg, rc == 0, verdict_line(rc, msg)))
         elif name == "cs_exec64":
             rc, msg = run_cmd([vk_compute, spv, "1", "exec64"], env=cs_env)
-            results.append((name, rc == 0, verdict_line(rc, msg)))
+            results.append((name,) + compute_result(rc, msg, rc == 0, verdict_line(rc, msg)))
         elif name in ("cs_bvh", "cs_bvh32"):   # the 64-bit and the 32-bit node pointer: one scene, the same words
             rc, msg = run_cmd([vk_compute, spv, "1", "bvh"], env=cs_env)
-            results.append((name, rc == 0, verdict_line(rc, msg)))
+            results.append((name,) + compute_result(rc, msg, rc == 0, verdict_line(rc, msg)))
         elif name in STORE_WORDS:
             # TEST-184: image atomics (cs_imgatomic, cs_imgatomic3d) and image_get_resinfo (cs_resinfo). vk_store_test
             # binds the images and prints the r32 ones after the dispatch; the expected words are check.py's.
@@ -956,8 +1030,8 @@ def run_suite(a, work: str) -> int:
             }[name]
             words = dump_words(msg)
             vals = words[:len(want)] if words else []
-            results.append((name, rc == 0 and vals == want,
-                            " ".join(hex(x) for x in vals) if vals else msg))
+            results.append((name,) + compute_result(rc, msg, rc == 0 and vals == want,
+                                                    " ".join(hex(x) for x in vals) if vals else msg))
         elif name == "cs_fmt_1010102":
             problem = fmt_1010102_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "64/64 dumped words exact"))
@@ -994,36 +1068,41 @@ def run_suite(a, work: str) -> int:
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=dict(cs_env or os.environ, **heap_init_env()))
             words = dump_words(msg)
             vals = words[:len(HEAP_INIT_EXPECTED)] if words else []
-            results.append((name, rc == 0 and vals == HEAP_INIT_EXPECTED,
-                            " ".join(hex(x) for x in vals) if vals else msg))
+            results.append((name,) + compute_result(rc, msg, rc == 0 and vals == HEAP_INIT_EXPECTED,
+                                                    " ".join(hex(x) for x in vals) if vals else msg))
         elif name == "cs_user_sgprs":
             # vk_compute_test seeds s4..s7 from VKC_SGPRS; the shader stores them back.
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=dict(cs_env or os.environ, **USER_SGPRS_ENV))
             words = dump_words(msg)
             vals = words[:len(USER_SGPRS_WORDS)] if words else []
-            results.append((name, rc == 0 and vals == USER_SGPRS_WORDS,
-                            " ".join(hex(x) for x in vals) if vals else msg))
+            results.append((name,) + compute_result(rc, msg, rc == 0 and vals == USER_SGPRS_WORDS,
+                                                    " ".join(hex(x) for x in vals) if vals else msg))
         elif name == "cs_f64_add":
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
-            if rc == 77:
-                results.append((name, None, "SKIP (no shaderFloat64 on this device)"))
+            if rc == 77:   # Float64, or Int64 where the module declares both: quote whichever it names
+                results.append((name, None, compute_unsupported(rc, msg) or "SKIP (no shaderFloat64 on this device)"))
             else:
                 ok, detail = judge_cs_dump(rc, msg, [0, 0x40040000], wave64=False, partial=False, emulated=False,
                                            hexwords=True)
                 results.append((name, ok, detail))
         elif name == "cs_cvt_f32_sat":
             # #300's saturating float -> int conversions: one dispatch per input word in s4 (VKC_SGPRS).
-            wrong = []
+            wrong, skip = [], None
             for bits, unsigned, signed in CVT_F32_SAT_CASES:
                 rc, msg = run_cmd([vk_compute, spv, "1", "dump"],
                                   env=dict(cs_env or os.environ, VKC_SGPRS=f"{bits:#010x}"))
+                if skip := compute_unsupported(rc, msg):   # the module, not this input: no other input can run either
+                    break
                 words = dump_words(msg)
                 if rc != 0 or not words or words[:2] != [unsigned, signed]:
                     got = " ".join(hex(x) for x in words[:2]) if words else msg.splitlines()[-1] if msg else "no output"
                     wrong.append(f"{bits:#010x} gave {got}, want {unsigned:#x} {signed:#x}")
             n = len(CVT_F32_SAT_CASES)
-            results.append((name, not wrong, f"{n}/{n} inputs exact" if not wrong
-                            else f"{len(wrong)}/{n} inputs wrong, first {wrong[0]}"))
+            if skip:
+                results.append((name, None, skip))
+            else:
+                results.append((name, not wrong, f"{n}/{n} inputs exact" if not wrong
+                                else f"{len(wrong)}/{n} inputs wrong, first {wrong[0]}"))
         elif name == "cs_fma_fused":
             # Single-rounded f32 FMA (+ f16 round-to-odd): strict under LEONIDA_FMA=khr (OpFmaKHR, exit 77 if
             # unsupported), fused-or-split f32 allowed under default --fma glsl (e.g. Mesa RADV splits 5/7).
@@ -1205,14 +1284,18 @@ def run_suite(a, work: str) -> int:
             results.append((name, ok, detail))
         elif name == "cs_imgstore":
             rc, msg = run_cmd([vk_store, spv])
-            results.append((name, rc == 0, verdict_line(rc, msg)))
+            results.append((name, *helper_result(rc, msg)))
         elif name in ("cs_imgload", "cs_imgload_d16", "cs_sample_lz_int_d16"):
             rc, msg = run_cmd([vk_store, spv, "load" if name == "cs_imgload" else "load-d16"])
-            results.append((name, rc == 0, verdict_line(rc, msg)))
+            results.append((name, *helper_result(rc, msg)))
         elif name in MIP_TEST_PASSES:
             problem = texture_mip_test(a.build, spirv_dir, name)
             ok = None if isinstance(problem, Skip) else not problem
             results.append((name, ok, problem or "two passes, 4096 RGBA32F pixels each exact; wrong mip and UV rejected"))
+        elif name == "ps_table_fetch":
+            problem = table_fetch_test(a.build, spirv_dir)
+            results.append((name, None if isinstance(problem, Skip) else not problem,
+                            problem or "4096 exact pixels each for SINT, UINT and descriptor miss"))
         elif name in GRADIENT_TESTS:
             problem = texture_gradient_a16_test(a.build, spirv_dir, name)
             ok = None if isinstance(problem, Skip) else not problem
@@ -1515,6 +1598,7 @@ def run_suite(a, work: str) -> int:
     print("\n=== GPU TEST RESULTS ===")
     passed = skipped = 0
     for name, ok, detail in results:
+        ok = None if isinstance(detail, Skip) else ok   # a check.py helper's "this device can't run it" (cs_fmt_*)
         tag = "SKIP" if ok is None else "PASS" if ok else "FAIL"
         passed += ok is True
         skipped += ok is None

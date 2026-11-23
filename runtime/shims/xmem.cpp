@@ -30,8 +30,6 @@
 #include <mutex>
 #include <set>
 #include <string>
-#include <tuple>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -41,21 +39,13 @@
 namespace {
 
 constexpr size_t kAlign = 64;
+constexpr size_t kNoSize = static_cast<size_t>(-1);  // XMemFree has no size field
 
-constexpr const char* kApiAlloc = "XMemAlloc";
-constexpr const char* kApiFree = "XMemFree";
-constexpr const char* kApiAllocDefault = "XMemAllocDefault";
-constexpr const char* kApiFreeDefault = "XMemFreeDefault";
-
-std::string caller_field(const void* caller) {
-    return ",\"caller\":" + rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller)));
-}
-
-// gta6rt --trace FILE: the first call of each allocator api (XMemAlloc, XMemFree and their Default forms) for each
-// distinct raw attribute word goes to the startup trace as an "xmem_attributes" event (api, the word, the size for an
-// allocation, the caller as module+RVA). The bits of the attribute word are not known yet; this records them from a
-// real run without logging every allocation, which would fill the file. Off: one relaxed load per call.
-void note_attributes(const char* api, bool is_alloc, uint64_t attributes, size_t size, const void* caller) {
+// gta6rt --trace FILE: the first XMemAlloc, XMemFree and XMemVirtualAlloc call for each distinct raw attribute word go to the
+// startup trace as an "xmem_attributes" event (api, the word, the size for an allocation, the caller as module+RVA). The
+// bits of the attribute word are not known yet; this records them from a real run without logging every allocation,
+// which would fill the file. Off: one relaxed load per call.
+void note_attributes(const char* api, uint64_t attributes, size_t size, const void* caller) {
     if (!rt::startup_trace::enabled()) return;
     static std::mutex mutex;
     static std::set<std::pair<std::string, uint64_t>> seen;
@@ -65,8 +55,9 @@ void note_attributes(const char* api, bool is_alloc, uint64_t attributes, size_t
     }
     std::string fields = std::string("\"api\":\"") + api +
                          "\",\"attributes\":" + rt::startup_trace::quote(rt::startup_trace::hex(attributes));
-    if (is_alloc) fields += ",\"size\":" + std::to_string(size);
-    fields += caller_field(caller);
+    if (size != kNoSize) fields += ",\"size\":" + std::to_string(size);
+    fields += ",\"caller\":" +
+              rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller)));
     rt::startup_trace::event("xmem_attributes", fields);
 }
 
@@ -95,42 +86,13 @@ std::atomic<AllocRoutine> g_alloc_hook{nullptr};
 std::atomic<FreeRoutine> g_free_hook{nullptr};
 
 void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
-    note_attributes(kApiAlloc, true, attributes, size, _ReturnAddress());
-    const AllocRoutine hook = g_alloc_hook.load(std::memory_order_acquire);
-    // Allocate directly: calling XMemAllocDefault would log a second, misleading XMemAllocDefault event.
-    return hook ? hook(size, attributes) : allocate_block(size);
+    note_attributes("XMemAlloc", attributes, size, _ReturnAddress());
+    return _aligned_malloc(size ? size : 1, kAlign);
 }
 
 void __stdcall XMemFree(void* p, uint64_t attributes) {
-    note_attributes(kApiFree, false, attributes, 0, _ReturnAddress());
-    const FreeRoutine hook = g_free_hook.load(std::memory_order_acquire);
-    if (hook)
-        hook(p, attributes);
-    else
-        _aligned_free(p);  // as above, without a second XMemFreeDefault event
-}
-
-// Both routines or neither: the GDK documents hooking only one of them as an error, and a lone hook would hand out
-// blocks the other side cannot release. Two nulls restore the defaults.
-void __stdcall XMemSetAllocationHooks(AllocRoutine alloc, FreeRoutine free_routine) {
-    if ((alloc == nullptr) != (free_routine == nullptr)) {
-        std::fprintf(stderr, "[rt] xmem: XMemSetAllocationHooks with only one routine ignored\n");
-        return;
-    }
-    g_free_hook.store(free_routine, std::memory_order_release);
-    g_alloc_hook.store(alloc, std::memory_order_release);
-}
-
-// BOOL XMemIsToolsMemAvailable(void). The measured title calls it from one helper, which six out-of-memory paths reach
-// only after an allocation has failed; the helper breaks into the debugger when the result is zero. Tools memory is
-// the extra memory of a development kit. A PC has none, so the answer is FALSE, and the title's own breakpoint marks
-// where it ran out of memory.
-BOOL WINAPI XMemIsToolsMemAvailable() {
-    static std::atomic<bool> warned{false};
-    if (!warned.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr, "[rt] xmem: XMemIsToolsMemAvailable -> FALSE (no devkit tools memory; logged once)\n");
-    }
-    return FALSE;
+    note_attributes("XMemFree", attributes, kNoSize, _ReturnAddress());
+    _aligned_free(p);
 }
 
 // Measured call sites pass a zeroed 64-byte structure. Only the MEMORY_BASIC_INFORMATION-compatible prefix is
@@ -266,124 +228,25 @@ bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
     return true;
 }
 
-// Physical pages and the windows they are mapped into. One mutex covers both tables and every map and unmap.
-//
-// A physical-page window is a reserve-only XMemVirtualAlloc in a guest page mode, or a reserve-only replacement of
-// part of a placeholder. On the host it is a placeholder, the only kind of reservation a section view can later
-// replace, and its protection is kept here: the map calls take none, so a mapped page gets its window's protection, as
-// AWE's MapUserPhysicalPages does.
-//
-// ASSUMPTION: a title does not commit memory inside such a window with kernel32!VirtualAlloc. A placeholder refuses a
-// plain commit; the measured windows are only ever passed to the map calls.
-struct Window {
-    SIZE_T size;
-    DWORD protect;
-};
+// The console's PAGE_GRAPHICS_* protection bits (winnt.h: PAGE_GRAPHICS_NOACCESS 0x800 .. PAGE_GRAPHICS_NOCACHE
+// 0x40000). The host refuses them with ERROR_INVALID_PARAMETER, and the D3D12 layer reads guest memory through the
+// CPU mapping, so only the CPU protection is applied. The retail executable passes 0x801 and 0x22004.
+constexpr DWORD kPageGraphicsMask = 0x0007F800;
 
-struct Section {
-    HANDLE handle;
-    explicit Section(HANDLE h) : handle(h) {}
-    Section(const Section&) = delete;
-    Section& operator=(const Section&) = delete;
-    ~Section() { CloseHandle(handle); }
-};
-
-struct PhysicalPage {
-    std::shared_ptr<Section> section;  // a mapped view holds its own reference to the section
-    uint64_t offset;
-};
-
-constexpr uint64_t kPhysicalPageSize = 0x10000;
-// Page numbers are 4 KiB frame numbers of 64 KiB pages: the measured title stores them packed and assumes each is a
-// non-zero multiple of 16 below 2^25, with 0 for an entry it unmaps. So a page number is slot * 16 with slot in
-// [1, 2^21), and freed slots are reused so a long run never runs out.
-constexpr uint64_t kFramesPerPage = kPhysicalPageSize / 0x1000;
-constexpr uint64_t kPageSlotLimit = uint64_t{1} << 21;
-
-std::mutex g_phys_mutex;
-std::map<uintptr_t, Window> g_windows;              // base -> window
-std::unordered_map<uint64_t, PhysicalPage> g_pages;  // page number -> backing
-std::vector<uint64_t> g_free_slots;
-uint64_t g_next_slot = 1;
-std::unordered_map<uintptr_t, uint64_t> g_mapped;  // mapped 64 KiB address -> page number
-
-// With g_phys_mutex held. A window replaces every window it overlaps: the title released those regions (with
-// kernel32!VirtualFree, which the shim does not see) before the host could hand the addresses out again.
-void record_window(void* base, SIZE_T size, DWORD protect) {
-    const uintptr_t start = reinterpret_cast<uintptr_t>(base);
-    const uintptr_t end = start + size;
-    auto it = g_windows.lower_bound(start);
-    if (it != g_windows.begin()) {
-        const auto prev = std::prev(it);
-        if (prev->first + prev->second.size > start) it = prev;
-    }
-    while (it != g_windows.end() && it->first < end) it = g_windows.erase(it);
-    g_windows[start] = Window{size, protect};
+DWORD host_protect(DWORD p) {
+    const DWORD cpu = p & ~kPageGraphicsMask;
+    return cpu ? cpu : PAGE_NOACCESS;
 }
 
-// With g_phys_mutex held: the window holding [address, address + bytes), if one does.
-const Window* find_window(uintptr_t address, uint64_t bytes) {
-    auto it = g_windows.upper_bound(address);
-    if (it == g_windows.begin()) return nullptr;
-    --it;
-    const uint64_t offset = address - it->first;
-    if (offset >= it->second.size || bytes > it->second.size - offset) return nullptr;
-    return &it->second;
-}
-
-// [address, address + size) as one placeholder of its own: split it out of the placeholder that holds it. Fails when
-// the range is not inside one placeholder.
-bool isolate_placeholder(void* address, SIZE_T size) {
-    MEMORY_BASIC_INFORMATION info{};
-    if (!VirtualQuery(address, &info, sizeof(info)) || info.State != MEM_RESERVE) {
-        SetLastError(ERROR_INVALID_ADDRESS);
-        return false;
-    }
-    if (info.AllocationBase == address && info.RegionSize == size) return true;
-    return VirtualFree(address, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != FALSE;
-}
-
-PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
-    MEM_ADDRESS_REQUIREMENTS requirements{};
-    MEM_EXTENDED_PARAMETER parameter{};
-    ULONG parameter_count = 0;
-    if (!address && alignment > kXmemPageSize64k) {
-        requirements.Alignment = alignment;
-        parameter.Type = MemExtendedParameterAddressRequirements;
-        parameter.Pointer = &requirements;
-        parameter_count = 1;
-    }
-    return placeholder_api().virtual_alloc2(GetCurrentProcess(), address, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-                                            PAGE_NOACCESS, parameter_count ? &parameter : nullptr, parameter_count);
-}
-
-// gta6rt --trace FILE: the first XMemVirtualAlloc for each distinct (type, attributes, protect) goes to the startup
-// trace as an "xmem_virtual_alloc" event with the size and the caller, so a run records the words the title passes.
-void note_virtual_alloc(DWORD type, uint64_t attributes, DWORD protect, SIZE_T size, const void* caller) {
-    if (!rt::startup_trace::enabled()) return;
-    static std::mutex mutex;
-    static std::set<std::tuple<DWORD, uint64_t, DWORD>> seen;
-    {
-        const std::lock_guard lock(mutex);
-        if (!seen.insert({type, attributes, protect}).second) return;
-    }
-    rt::startup_trace::event(
-        "xmem_virtual_alloc",
-        "\"api\":\"XMemVirtualAlloc\",\"type\":" + rt::startup_trace::quote(rt::startup_trace::hex(type)) +
-            ",\"attributes\":" + rt::startup_trace::quote(rt::startup_trace::hex(attributes)) +
-            ",\"protect\":" + rt::startup_trace::quote(rt::startup_trace::hex(protect)) +
-            ",\"size\":" + std::to_string(static_cast<uint64_t>(size)) + caller_field(caller));
-}
-
-// PVOID XMemVirtualAlloc(address, size, allocationType, attributes, protect). All 23 calls of the measured title pass a
-// nonzero attribute word; its bits are not decoded and nothing on the host depends on them, so it is accepted and only
-// traced. Its types cover committed 2 MiB and 64 KiB pages, reserve-only 64 KiB windows for physical pages, one
-// MEM_RESERVE_PLACEHOLDER reservation and five MEM_REPLACE_PLACEHOLDER windows carved out of it, each then filled with
-// XMemMapPhysicalPages. The guest page size sets the alignment and rounding of the region; the host's own pages stay
-// 4 KiB (host large pages need SeLockMemoryPrivilege). A 2 MiB region the host places is reserved 2 MiB-aligned through
-// VirtualAlloc2.
 void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
-    note_virtual_alloc(allocation_type, attributes, protect, size, _ReturnAddress());
+    // Host-backed support covers ordinary and 64 KiB guest reservations. The 2 MiB guest mode needs an aligned
+    // reservation strategy that this shim does not provide, so fail explicitly instead of returning a misaligned
+    // region.
+    //
+    // The attribute word is recorded, not applied, as for XMemAlloc: the host has no allocator ids or memory types.
+    // The retail executable passes 0x21, 0x3, 0x183, 0x283 and 0x181 and stops at an int3 when a reservation
+    // returns NULL, so refusing a nonzero word is not an option.
+    note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
@@ -456,247 +319,7 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         return nullptr;
     }
 
-    if (replace) {
-        const std::lock_guard lock(g_phys_mutex);
-        if (!isolate_placeholder(address, size)) return nullptr;
-        if (window) {
-            // A reserve-only replacement stays a placeholder: the physical pages are mapped into it.
-            record_window(address, size, host_prot);
-            return address;
-        }
-        return placeholder_api().virtual_alloc2(GetCurrentProcess(), address, size, host_type | MEM_RESERVE, host_prot,
-                                                nullptr, 0);
-    }
-    if (new_placeholder || window) {
-        void* const result = reserve_placeholder(address, size, base_granularity);
-        if (result && window) {
-            const std::lock_guard lock(g_phys_mutex);
-            record_window(result, size, host_prot);
-        }
-        return result;
-    }
-    if (page_mode == kXmemLargePages && address == nullptr) {
-        MEM_ADDRESS_REQUIREMENTS requirements{};
-        requirements.Alignment = kXmemPageSize2m;
-        MEM_EXTENDED_PARAMETER parameter{};
-        parameter.Type = MemExtendedParameterAddressRequirements;
-        parameter.Pointer = &requirements;
-        return placeholder_api().virtual_alloc2(GetCurrentProcess(), nullptr, size, host_type | MEM_RESERVE, host_prot,
-                                                &parameter, 1);
-    }
-    return VirtualAlloc(address, size, host_type, host_prot);
-}
-
-// With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.
-bool unmap_page(uintptr_t address) {
-    const auto it = g_mapped.find(address);
-    if (it == g_mapped.end()) return true;
-    if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(address),
-                                       MEM_PRESERVE_PLACEHOLDER)) {
-        return false;
-    }
-    g_mapped.erase(it);
-    return true;
-}
-
-// With g_phys_mutex held. Maps physical page `page` (0: unmap) at the 64 KiB-aligned `address`, replacing what was
-// mapped there. The caller has found the window.
-bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
-    if (!unmap_page(address)) return false;
-    if (page == 0) return true;
-    const auto it = g_pages.find(page);
-    if (it == g_pages.end()) {
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return false;
-    }
-    void* const target = reinterpret_cast<void*>(address);
-    if (!isolate_placeholder(target, kPhysicalPageSize)) return false;
-    void* const view = placeholder_api().map_view3(it->second.section->handle, GetCurrentProcess(), target,
-                                                   it->second.offset, kPhysicalPageSize, MEM_REPLACE_PLACEHOLDER,
-                                                   protect, nullptr, 0);
-    if (!view) return false;
-    g_mapped[address] = page;
-    return true;
-}
-
-// Two of the measured windows are reserved PAGE_NOACCESS for the CPU and the GPU alike; pages mapped there are still
-// GPU memory, which the D3D12 layer reads on the CPU.
-DWORD view_protect(const Window& window) {
-    return window.protect == PAGE_NOACCESS ? PAGE_READWRITE : window.protect;
-}
-
-bool aligned_page_address(uintptr_t address) { return (address & (kPhysicalPageSize - 1)) == 0; }
-
-// gta6rt --trace FILE: the first XMemAllocatePhysicalPages for each distinct attribute word goes to the startup trace
-// as an "xmem_physical_pages" event with the page count and the caller.
-void note_physical_attributes(uint64_t attributes, uint64_t count, const void* caller) {
-    if (!rt::startup_trace::enabled()) return;
-    static std::mutex mutex;
-    static std::set<uint64_t> seen;
-    {
-        const std::lock_guard lock(mutex);
-        if (!seen.insert(attributes).second) return;
-    }
-    rt::startup_trace::event("xmem_physical_pages",
-                             "\"api\":\"XMemAllocatePhysicalPages\",\"attributes\":" +
-                                 rt::startup_trace::quote(rt::startup_trace::hex(attributes)) +
-                                 ",\"pages\":" + std::to_string(count) + caller_field(caller));
-}
-
-// BOOL XMemAllocatePhysicalPages(attributes, UINT64* pageCount, UINT64* pageArray). Measured at four call sites: RCX is
-// a constant attribute word, RDX points at the number of 64 KiB pages (every caller computes it as the byte size
-// rounded up and shifted right by 16), R8 at an array that receives one page number per page. The result is tested as
-// a 32-bit BOOL. After success every caller compares the count with the one it asked for and frees the pages if they
-// differ, so the count is in/out.
-//
-// Each call is backed by one pagefile-backed section of count * 64 KiB: committed (charged) at once, given physical
-// memory as it is touched, zero-filled. Pages keep their contents while unmapped or mapped elsewhere, and one page can
-// be mapped at several addresses. ASSUMPTION: the attribute word (memory type, perhaps the page size) is not decoded;
-// every page is 64 KiB, which all four callers' arithmetic agrees with.
-BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count, uint64_t* page_array) {
-    note_physical_attributes(attributes, page_count ? *page_count : 0, _ReturnAddress());
-    if (!page_count || (*page_count && !page_array)) {
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return FALSE;
-    }
-    const uint64_t count = *page_count;
-    if (count == 0) return TRUE;
-
-    const std::lock_guard lock(g_phys_mutex);
-    if (count > g_free_slots.size() + (kPageSlotLimit - g_next_slot)) {
-        *page_count = 0;
-        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
-        return FALSE;
-    }
-    const uint64_t bytes = count * kPhysicalPageSize;  // below 2^37: count is below 2^21
-    const HANDLE handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
-                                             static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), nullptr);
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr, "[rt] xmem-probe: AllocatePhysicalPages count=%llu bytes=%llu handle=%p\n",
-                     static_cast<unsigned long long>(count), static_cast<unsigned long long>(bytes), handle);
-    }
-    if (!handle) {
-        *page_count = 0;
-        return FALSE;
-    }
-    const auto section = std::make_shared<Section>(handle);
-    for (uint64_t i = 0; i < count; ++i) {
-        uint64_t slot;
-        if (!g_free_slots.empty()) {
-            slot = g_free_slots.back();
-            g_free_slots.pop_back();
-        } else {
-            slot = g_next_slot++;
-        }
-        const uint64_t page = slot * kFramesPerPage;
-        g_pages[page] = PhysicalPage{section, i * kPhysicalPageSize};
-        page_array[i] = page;
-    }
-    static std::atomic<bool> done_logged{false};
-    if (!done_logged.exchange(true, std::memory_order_relaxed))
-        std::fprintf(stderr, "[rt] xmem-probe: AllocatePhysicalPages done first=%llu last=%llu\n",
-                     static_cast<unsigned long long>(page_array[0]),
-                     static_cast<unsigned long long>(page_array[count - 1]));
-    return TRUE;
-}
-
-// BOOL XMemFreePhysicalPages(UINT64 pageCount, UINT64* pageArray). Measured at three call sites: RCX is the count (the
-// one XMemAllocatePhysicalPages returned, or the sum of several allocations), RDX the array. The callers unmap the
-// pages first; a page that is still mapped keeps its memory until it is unmapped. FALSE, with the entries before it
-// freed, for a number that is not a live page.
-BOOL WINAPI XMemFreePhysicalPages(uint64_t page_count, const uint64_t* page_array) {
-    if (page_count && !page_array) {
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return FALSE;
-    }
-    const std::lock_guard lock(g_phys_mutex);
-    for (uint64_t i = 0; i < page_count; ++i) {
-        const auto it = g_pages.find(page_array[i]);
-        if (it == g_pages.end()) {
-            SetLastError(ERROR_INVALID_PARAMETER);
-            return FALSE;
-        }
-        g_pages.erase(it);
-        g_free_slots.push_back(page_array[i] / kFramesPerPage);
-    }
-    return TRUE;
-}
-
-// PVOID XMemMapPhysicalPages(PVOID address, UINT64 pageCount, UINT64* pageArray). Measured at twelve call sites: RCX
-// is an address in a window XMemVirtualAlloc reserved, RDX a 64-bit count, R8 the pages to map there one after another,
-// or null to unmap that many (four calls at shutdown). Callers test the 64-bit result for zero, so it is the address on
-// success. A page number of 0 in the array unmaps that one page.
-//
-// Each page is its own view (MapViewOfFile3 into a 64 KiB placeholder), so any page can be remapped or unmapped later
-// without touching its neighbours. A failure part-way leaves the pages before it mapped.
-void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint64_t* page_array) {
-    static std::atomic<bool> logged{false};
-    if (!logged.exchange(true, std::memory_order_relaxed))
-        std::fprintf(stderr, "[rt] xmem-probe: MapPhysicalPages address=%p count=%llu array=%p\n", address,
-                     static_cast<unsigned long long>(page_count), page_array);
-    const uintptr_t start = reinterpret_cast<uintptr_t>(address);
-    if (!aligned_page_address(start) || page_count > (std::numeric_limits<uintptr_t>::max)() / kPhysicalPageSize ||
-        start > (std::numeric_limits<uintptr_t>::max)() - page_count * kPhysicalPageSize) {
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return nullptr;
-    }
-    if (!placeholder_api().available()) {
-        SetLastError(ERROR_NOT_SUPPORTED);
-        return nullptr;
-    }
-    const std::lock_guard lock(g_phys_mutex);
-    if (!page_array) {
-        for (uint64_t i = 0; i < page_count; ++i) {
-            if (!unmap_page(start + i * kPhysicalPageSize)) return nullptr;
-        }
-        return address;
-    }
-    const Window* const window = find_window(start, page_count * kPhysicalPageSize);
-    if (!window) {
-        SetLastError(ERROR_INVALID_ADDRESS);
-        return nullptr;
-    }
-    const DWORD protect = view_protect(*window);
-    for (uint64_t i = 0; i < page_count; ++i) {
-        if (!map_page(start + i * kPhysicalPageSize, page_array[i], protect)) return nullptr;
-    }
-    return address;
-}
-
-// BOOL XMemMapPhysicalPagesScatter(PVOID* addresses, UINT32 pageCount, UINT64* pageArray). Measured at two call sites:
-// RCX is an array of addresses, EDX a 32-bit count, R8 the page for each address (an entry of 0, or a null array,
-// unmaps). The result is tested as a 32-bit BOOL. Like MapUserPhysicalPagesScatter: entry i maps pageArray[i] at
-// addresses[i].
-BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_count, const uint64_t* page_array) {
-    if (page_count && !addresses) {
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return FALSE;
-    }
-    if (!placeholder_api().available()) {
-        SetLastError(ERROR_NOT_SUPPORTED);
-        return FALSE;
-    }
-    const std::lock_guard lock(g_phys_mutex);
-    for (uint32_t i = 0; i < page_count; ++i) {
-        const uintptr_t address = reinterpret_cast<uintptr_t>(addresses[i]);
-        if (!aligned_page_address(address)) {
-            SetLastError(ERROR_INVALID_PARAMETER);
-            return FALSE;
-        }
-        const uint64_t page = page_array ? page_array[i] : 0;
-        if (page == 0) {
-            if (!unmap_page(address)) return FALSE;
-            continue;
-        }
-        const Window* const window = find_window(address, kPhysicalPageSize);
-        if (!window) {
-            SetLastError(ERROR_INVALID_ADDRESS);
-            return FALSE;
-        }
-        if (!map_page(address, page, view_protect(*window))) return FALSE;
-    }
-    return TRUE;
+    return VirtualAlloc(address, size, host_type, host_protect(protect));
 }
 
 UINT WINAPI XMemGetWriteWatch(DWORD flags, void* base_address, SIZE_T region_size, void** addresses, ULONG_PTR* count,
@@ -759,13 +382,13 @@ BOOL WINAPI XMemTransferMemory(uint32_t type, SIZE_T size) {
 // with ERROR_INVALID_PARAMETER (measured on Windows 11 26200: VirtualAlloc(NULL, 64 KiB, MEM_COMMIT | MEM_RESERVE |
 // 0x10000000, PAGE_READWRITE) returns NULL; so does 0x40000000), so an engine allocating its heaps this way gets
 // NULL at boot. Both are hints about where the memory lives; the host has no such split, so they are dropped and
-// the rest is passed through. Not done: the console protection bits, and whether graphics memory has to come from
-// an arena the D3D12 layer can see (#313).
+// the rest is passed through. The PAGE_GRAPHICS_* protection bits are dropped (host_protect). Not done: whether
+// graphics memory has to come from an arena the D3D12 layer can see (#313).
 constexpr DWORD kMemGraphics = 0x10000000;
 constexpr DWORD kMemTitle = 0x40000000;
 
 LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect) {
-    return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), protect);
+    return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
 }
 
 // XMemMakeTag packs a four-character code into the top 24 bits of an XMem flags word, six bits per character from the
@@ -835,18 +458,5 @@ SHIM_TABLE(xmem,
     {"xmem.dll", "XMemVirtualAlloc", reinterpret_cast<void*>(&XMemVirtualAlloc)},
     {"xmem.dll", "XMemGetWriteWatch", reinterpret_cast<void*>(&XMemGetWriteWatch)},
     {"xmem.dll", "XMemResetWriteWatch", reinterpret_cast<void*>(&XMemResetWriteWatch)},
-    {"xmem.dll", "XMemAllocDefault", reinterpret_cast<void*>(&XMemAllocDefault)},
-    {"xmem.dll", "XMemFreeDefault", reinterpret_cast<void*>(&XMemFreeDefault)},
-    {"xmem.dll", "XMemSetAllocationHooks", reinterpret_cast<void*>(&XMemSetAllocationHooks)},
-    {"xmem.dll", "XMemMakeTag", reinterpret_cast<void*>(&XMemMakeTag)},
-    {"xmem.dll", "XMemSetOption", reinterpret_cast<void*>(&XMemSetOption)},
-    {"xmem.dll", "XMemSetWin32HeapTrackingHooks", reinterpret_cast<void*>(&XMemSetWin32HeapTrackingHooks)},
-    {"xmem.dll", "XMemIsToolsMemAvailable", reinterpret_cast<void*>(&XMemIsToolsMemAvailable)},
-    {"xmem.dll", "XMemGetTitleHeap", reinterpret_cast<void*>(&XMemGetTitleHeap)},
-    {"xmem.dll", "XMemPreallocateFreeSpace", reinterpret_cast<void*>(&XMemPreallocateFreeSpace)},
     {"xmem.dll", "XMemTransferMemory", reinterpret_cast<void*>(&XMemTransferMemory)},
-    {"xmem.dll", "XMemAllocatePhysicalPages", reinterpret_cast<void*>(&XMemAllocatePhysicalPages)},
-    {"xmem.dll", "XMemFreePhysicalPages", reinterpret_cast<void*>(&XMemFreePhysicalPages)},
-    {"xmem.dll", "XMemMapPhysicalPages", reinterpret_cast<void*>(&XMemMapPhysicalPages)},
-    {"xmem.dll", "XMemMapPhysicalPagesScatter", reinterpret_cast<void*>(&XMemMapPhysicalPagesScatter)},
 );

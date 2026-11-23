@@ -2093,29 +2093,6 @@ The trace will enumerate them.
   - **The three draws:** a 2×2×1 and a 1×1×2 mesh grid, plus a VS PSO from a stream.
   - **What it doesn't cover:** whether the console flattens a 3D `DispatchMesh` grid the same way. That is an open
     question in `docs/design.md`, "Mesh shaders"; the test shader reads the workgroup ID directly.
-- **`ExecuteIndirect` with `DISPATCH_MESH` signatures:** `CreateCommandSignature` takes them where
-  `VK_EXT_mesh_shader` is enabled (`E_NOTIMPL` without it, as mesh PSOs are), with `DISPATCH_MESH` as the one
-  argument; root constants or views before it are `E_NOTIMPL` (not expanded, section 4.7); `IndirectKind::dispatch_mesh`.
-  `D3D12_DISPATCH_MESH_ARGUMENTS` and `VkDrawMeshTasksIndirectCommandEXT` are the same three dwords, so the records
-  are read as they are. The call records the state `DispatchMesh` takes (no topology, vertex or index buffers) and
-  replays as a whole draw issuing `vkCmdDrawMeshTasksIndirectEXT`, or `vkCmdDrawMeshTasksIndirectCountEXT` with a
-  count buffer (which also needs `drawIndirectCount`; without it the call is `ReplayResult::unsupported`). As for the
-  draw kinds, a call without a count buffer takes at most `maxDrawIndirectCount` records, and one record without
-  `multiDrawIndirect` (VUID-vkCmdDrawMeshTasksIndirectEXT-drawCount-02718/02719); with one, `MaxCommandCount` is the
-  call's `maxDrawCount` and the GPU-written count is not checked against the limit. A record's group counts are GPU data, so D3D12's limits
-  (65535 per count, 2^22 groups) are not checked; counts past the device's `maxMeshWorkGroupCount` are undefined on
-  both APIs. A DISPATCH_MESH call with a VS PSO, or a draw signature with a mesh PSO and a topology set, is
-  `ReplayResult::invalid_draw`; a draw signature with no topology set records the bare call, which replay refuses as
-  `unsupported`, as for any draw signature without a topology.
-- **Translated mesh shaders through the layer:** `d3d12_m5_mesh_test` (section 6, M5) draws `ms_m5.asm`, an NGG
-  wave64 mesh shader of 128 threads written with the corpus's idioms (group index from `v5`, thread id from `s3` and
-  `mbcnt`, `GS_ALLOC_REQ`, per-thread exports), translated by `rdna2spirv.py`; the mesh stage asks for subgroup size 64 (required on the RX 9070 XT), and the test
-  exits 77 where it cannot run 64-wide.
-  `runtime/test/shaders/build.py` makes a mesh shader's PSV0 container from a `; psv0: THREADS MAX_VERTICES
-  MAX_PRIMITIVES` header line. Two things the census in section 3.5 raises and this layer does not do yet: root
-  arguments are packed from s0 for the mesh stage too, while the corpus reads mesh user data from s16; and s3 is the
-  merged wave info in the translator's mesh ABI, so a fourth root dword is out of a mesh shader's reach under the
-  s0 packing (`ms_m5.asm` reads s0..s2 only).
 
 ## 4. Object model mapping
 
@@ -3324,6 +3301,25 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   results still match and all 11 statistics counters are zero. Without a statistics pool (single-list `replay()` or
   a queue without the summation helper), these three commands are refused before helper scratch allocation or
   recording. The resolve fallback is unchanged: only resolves needing dispatches are refused there.
+- **Mesh draws during a pipeline-statistics query** (D3D-291). D3D12 allows `DispatchMesh` inside a statistics query
+  and reads its input-assembly, vertex, geometry and tessellation fields as 0. Vulkan forbids `vkCmdDrawMeshTasksEXT`
+  while a query with those counters is active (`VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076`), and the heap's
+  pool has all eleven. So a statistics query that holds a mesh draw is split as above, and a split before a draw stays
+  outside its rendering scope. A segment's first draw decides its pool: the submission's full pool, or a second pool
+  with only clipping invocations and primitives, fragment and compute invocations. A later draw of the other kind ends
+  the segment and begins one of its own kind; dispatches and segments without draws use the full pool, and
+  `ExecuteIndirect` draws count as vertex draws. The sum copies a mesh segment's four counters into fields 5 to 8 of
+  its record, and `statistics_sum.comp` adds them as `CInvocations`, `CPrimitives`, `PSInvocations` and
+  `CSInvocations`, so the other fields get nothing from it. A query that holds only mesh draws is one mesh segment,
+  resolved through the same sum. Without the compute helper there is no segment pool and such a list is refused
+  (`unsupported`) rather than run unsplit; so is one on the single-list `replay()` (D3D-399), whose
+  `create_segment_pool` gives no mesh pool. Overlapping statistics queries (D3D-252) split the same way inside their
+  shared segments: a draw of the other kind than the open segment's opens a new one, so every query that segment
+  belongs to sums both kinds. `replay_query_predication_test` (cases 15 and 16) checks the split points, the segment
+  kinds and the resolve plan on the CPU. `d3d12_mesh_test` resolves a query around a vertex, two mesh and a vertex
+  draw, one around a mesh draw and one around the two vertex draws: the vertex fields count only the two triangles,
+  and the mixed query has more clipping and pixel-shader invocations than the vertex-only one. On the RX 9060 XT
+  (RADV), the clipping counts add up exactly (2 + 10 = 12).
 - **Timestamps.** `GetTimestampFrequency` is `1e9 / timestampPeriod` (1 GHz on the test GPU). Every D3D12 queue
   shares one `VkQueue` for now (question 12), so they share one frequency.
 - **Timestamp resolves on MoltenVK.** On Apple GPUs, MoltenVK delays every `vkCmdWriteTimestamp` to the end of
@@ -3528,8 +3524,6 @@ to be recovered from call sites (or the NDA GDK headers, if a developer has acce
 | DCC / texture compatibility | Public release note for `D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY` | Let Vulkan choose compression; fail if the game aliases/reads raw compressed data. |
 | PresentX / present planes / frame events | Public GDK samples (MIT/zlib), §4.5 | Likely the only present path of a GDKX title. Presenter + vblank-timed frame events; 1-2 planes composed into the Vulkan swapchain (placement, filter, alpha overlay, HDR10 conversions). Call shapes known; slots/layouts **Open**. |
 | Device slots 48/73/78/79/80 | Public HLE `Freminet`/`ScarlettX` (third-party, not Microsoft documentation) | `d3d12_xs_device.cpp` routes `CreateCommandQueueX` (48), `CreateCommandListX` (73), `SetFrameIntervalX` (78), `ScheduleFrameEventX` (79) and `WaitFrameEventX` (80) before it indexes the PC vtable. Queue and list creation use the existing create paths. The frame-event calls are a per-device token counter: `WaitFrameEventX` returns at once with a fresh non-zero token, because there is no vblank source before a presenter exists. The five indices can be moved with `LEONIDA_XS_QUEUE_X_SLOT`, `LEONIDA_XS_LIST_X_SLOT`, `LEONIDA_XS_FRAME_INTERVAL_SLOT`, `LEONIDA_XS_SCHEDULE_EVENT_SLOT` and `LEONIDA_XS_WAIT_EVENT_SLOT` (3..127; a value that names a slot the proxy already handles keeps that slot's handler); a trace that disagrees wins. |
-| Indirect argument type 105 | The retail title's startup creates five one-argument command signatures (device slot 41) with no root signature; one has type 105 and a 12-byte stride. Its two `ExecuteIndirect` sites, read statically, set the compute state first, as the `DISPATCH` sites do, and pass one command from the same argument buffer, on a second command list | `d3d12_xs_device.cpp` creates it as `DISPATCH` (`D3D12_DISPATCH_ARGUMENTS`). What the console does differently for it is **Open**. |
-| Device slot 61 | The retail title's boot under `gta6rt --run` (stop 20 of the RT-5 measurements in #6910): called as `(desc, dest handle)` once per sampler | `d3d12_xs_device.cpp` routes it to the PC `CreateSampler` (slot 22) with the description's PC `D3D12_SAMPLER_DESC` prefix; the PC slot 61 is `CreateMetaCommand`. The layout of the description beyond the PC fields is **Open**. |
 | VRS | Public `D3D12_SHADING_RATE` / `D3D12_AXIS_SHADING_RATE` | `VK_KHR_fragment_shading_rate`; `RSSetShadingRate`/image-based rate map to `vkCmdSetFragmentShadingRateKHR`. |
 | Mesh shader tier | Public `D3D12_MESH_SHADER_TIER` | `VK_EXT_mesh_shader`; the 9,282 translated mesh shaders make this a hard requirement for any content that uses them. |
 | Wave MMA | Public `D3D12_WAVE_MMA_TIER` | Not used: no shader sets `WAVE_MMA` in SFI0 and none contains `v_mfma`/`v_wmma` (all 26,503, `tools/feature_scan.py`). Answer the tier query truthfully; no cooperative-matrix mapping is needed. |

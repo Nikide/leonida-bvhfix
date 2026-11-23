@@ -108,23 +108,11 @@ are deduped by basename, so an import graph that reaches the same DLL twice maps
 key uses the filesystem's native path representation with ASCII case folded; it does not require a
 Windows filename to fit the ANSI code page. A lossless legacy narrow filename alias retains the existing
 bytewise case behavior for narrow API and import-name lookups. `Module::name`, mapped address labels,
-and path diagnostics use UTF-8. The `LoadLibrary*`/`GetModuleHandle*` shims look a wide name up by its native
-basename when it has a character outside ASCII (`Loader::find_loaded_module_w`, `load_runtime_module_w`), and
-module names compare case-insensitively with the system's own table (`CompareStringOrdinal`), as Windows
-compares them; a narrow name outside ASCII compares the same way through the ANSI code page.
-
-The game's code is built for the console's AMD Zen 2 and uses a few of its instructions without asking CPUID: SSE4a
-`insertq`/`extrq`, `clzero` and `monitorx`/`mwaitx` (no Intel CPU has them) and `clwb` (Intel since Ice Lake)
-([docs/cpu_features.md](../docs/cpu_features.md)). A host without one raises `#UD` there, so `gta6rt` installs a
-vectored handler before any image code runs (`src/cpu_emulation.h`): it recognises those encodings at the faulting
-address, does the same work on the thread's context and continues after the instruction. It prints one `[rt] cpu:`
-line at startup naming what the host lacks, and one the first time each instruction is emulated. On a host that has
-them the CPU runs them and the handler never sees them. Each emulated instruction costs an exception round trip, so a
-hot loop of them is slow; patching such a site in place is a later step. `cpu_emulation_test` runs every form for
-real: natively on a Zen host, through the handler on an Intel one.
+and path diagnostics use UTF-8. This does not add Unicode case folding or change the separately defined
+`LoadLibrary`/`GetModuleHandle` API conversions.
 
 `module_names` checks native and mapped renamed DLLs, distinct Unicode identities, basename cache
-reuse, existing ACP aliases, the wide and case-insensitive lookups, export execution, and path errors. On native Windows with Python available,
+reuse, existing ACP aliases, export execution, and path errors. On native Windows with Python available,
 `run_module_names` compares original renamed EXEs through native execution and `--dry-run`, `--init`,
 and `--run`, including a Unicode parent directory and an ACP-named imported DLL. It checks strict UTF-8
 trace names and unchanged fixture bytes. Both tests use only locally built synthetic images.
@@ -378,9 +366,7 @@ from the ANSI code page.
 | `tls_callback` | before each TLS callback the Loader runs (process attach and detach; thread events run under the Windows loader lock and are not traced) | `module`, `at` (module+RVA), `reason` |
 | `dllmain` | after `DllMain(DLL_PROCESS_ATTACH)` returns | `module`, `result` |
 | `unimplemented_call` | first call of each unimplemented import | `import` (`dll!name`), `caller` (module+RVA) |
-| `xmem_attributes` | the first `XMemAlloc`, `XMemFree`, `XMemAllocDefault` and `XMemFreeDefault` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (the allocators only), `caller` (module+RVA) |
-| `xmem_virtual_alloc` | the first `XMemVirtualAlloc` for each distinct (type, attributes, protect) | `api`, `type`, `attributes`, `protect`, `size`, `caller` |
-| `xmem_physical_pages` | the first `XMemAllocatePhysicalPages` for each distinct attribute word | `api`, `attributes`, `pages`, `caller` |
+| `xmem_attributes` | the first `XMemAlloc` and the first `XMemFree` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (`XMemAlloc` only), `caller` (module+RVA) |
 | `file_open_failed` | a guest `CreateFileW`/`CreateFile2` that fails (at most 256 events) | `api`, `path` (as the title passed it), `error` (Win32), `caller` (module+RVA) |
 | `int3_skipped` | with `LEONIDA_SKIP_INT3` set: first int3 at each address, which is then stepped over | `at` (module+RVA) |
 | `debug_string` | `OutputDebugStringA/W` with no debugger attached | `text` |

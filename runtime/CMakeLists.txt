@@ -291,16 +291,6 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(file_system_test PRIVATE /OPT:NOREF)
   target_link_libraries(file_system_test PRIVATE advapi32)  # the ACL calls of the unlistable-marker-folder check
 
-  # Shim registry constant-initialized lazy state and XCRDAPI.dll!DStorageGetFactory return-class checks.
-  add_executable(registry_init_and_classify_test
-    test/registry_init_and_classify_test.cpp
-    shims/registry.cpp
-  )
-  target_include_directories(registry_init_and_classify_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
-  target_compile_definitions(registry_init_and_classify_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-  target_compile_options(registry_init_and_classify_test PRIVATE /W4 /permissive- /utf-8)
-  target_link_options(registry_init_and_classify_test PRIVATE /OPT:NOREF)
-
   # LEONIDA_SKIP_INT3 (shims/startup_trace.h): its own executable, the variable is read once per process.
   add_executable(int3_skip_test
     test/int3_skip_test.cpp
@@ -310,19 +300,6 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(int3_skip_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(int3_skip_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(int3_skip_test PRIVATE /OPT:NOREF)
-
-  # Xbox DirectStorage (DStorageGetFactory under dstorage_xs.dll, xcrdapi.dll and dstorage.dll) over synthetic files:
-  # GAME: paths through the file shims, queues, status arrays, fences and errors. No GPU, no game data.
-  add_executable(dstorage_test
-    test/dstorage_test.cpp
-    shims/dstorage.cpp
-    shims/file_system.cpp
-    shims/registry.cpp
-  )
-  target_include_directories(dstorage_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
-  target_compile_definitions(dstorage_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-  target_compile_options(dstorage_test PRIVATE /W4 /permissive- /utf-8)
-  target_link_options(dstorage_test PRIVATE /OPT:NOREF)
 
   # Offline WinHTTP for mapped images (the package's XCurl.dll and libHttpClient.GDK.dll); no network is touched.
   add_executable(winhttp_offline_test
@@ -639,53 +616,6 @@ if(BUILD_TESTING)
       endif()
     endif()
 
-    # Window shim: a mapped guest registers a class whose WNDPROC is in the guest and creates a window with the
-    # guest's hInstance, as the retail executable does with sgaWindowClass. Import stubs give the guest the two
-    # ext-ms DLL names the shipped exe imports; they live in a subfolder so the loader cannot find them beside the
-    # guest, and the shim registry answers all of them. /NODEFAULTLIB:user32.lib keeps the linker from resolving the
-    # calls to the host's user32.lib instead.
-    add_library(window_extms_ansi SHARED test/fixtures/window_ansi_stub.cpp test/fixtures/window_ansi_stub.def)
-    add_library(window_extms_win SHARED test/fixtures/window_win_stub.cpp test/fixtures/window_win_stub.def)
-    foreach(target window_extms_ansi window_extms_win)
-      target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-      target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8)
-      set_target_properties(${target} PROPERTIES
-        PREFIX ""
-        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/window/$<CONFIG>"
-        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/window/$<CONFIG>"
-      )
-    endforeach()
-    set_target_properties(window_extms_ansi PROPERTIES OUTPUT_NAME ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0)
-    set_target_properties(window_extms_win PROPERTIES OUTPUT_NAME ext-ms-win-rtcore-ntuser-window-l1-1-0)
-    add_library(window_guest SHARED test/fixtures/window_guest.cpp)
-    target_link_libraries(window_guest PRIVATE window_extms_ansi window_extms_win)
-    target_compile_definitions(window_guest PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_compile_options(window_guest PRIVATE /W4 /permissive- /utf-8 /GS-)
-    target_link_options(window_guest PRIVATE /NODEFAULTLIB:user32.lib)
-    set_target_properties(window_guest PROPERTIES
-      OUTPUT_NAME window_guest
-      PREFIX ""
-      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
-      ARCHIVE_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
-      MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
-    )
-    add_executable(window_test
-      test/window_test.cpp
-      src/pe_loader.cpp
-      shims/registry.cpp
-      shims/library_loader.cpp
-      shims/window.cpp
-    )
-    target_include_directories(window_test PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/src
-      ${CMAKE_CURRENT_SOURCE_DIR}/shims
-    )
-    target_compile_definitions(window_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_compile_options(window_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
-    target_link_options(window_test PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
-    add_dependencies(window_test gta6rt_tls_host window_guest)
-    add_test(NAME window COMMAND window_test "$<TARGET_FILE:window_guest>")
-
     # pe_loader.cpp needs the shim registry for shims::find/make_unimplemented_thunk. The xmem and d3d12_xs tables
     # are linked too so the optional LEONIDA_GAME_DIR run classifies the shipped modules' imports exactly like
     # gta6rt does (no d3d12.lib is needed: d3d12_xs resolves its host entry points at run time).
@@ -993,7 +923,6 @@ if(BUILD_TESTING)
     # The routes are read once per process, so each override case is its own test.
     add_test(NAME xs_proxy_mock_env_slots COMMAND xs_proxy_mock_test --env-slots)
     add_test(NAME xs_proxy_mock_env_slots_invalid COMMAND xs_proxy_mock_test --env-slots-invalid)
-    add_test(NAME xs_proxy_mock_env_slots_70 COMMAND xs_proxy_mock_test --env-slots-70)
   endif()
   if(TARGET root_sig_test)
     add_test(NAME root_sig COMMAND root_sig_test)
@@ -1143,9 +1072,6 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET file_system_test)
     add_test(NAME file_system COMMAND file_system_test)
-  endif()
-  if(WIN32 AND TARGET registry_init_and_classify_test)
-    add_test(NAME registry_init_and_classify COMMAND registry_init_and_classify_test)
   endif()
   if(WIN32 AND TARGET int3_skip_test)
     add_test(NAME int3_skip COMMAND int3_skip_test)
@@ -1311,6 +1237,13 @@ if(LEONIDA_D3D12_SHIM_TESTS)
 endif()
 endif()
 
+# CPU-only: which SPIR-V capabilities make the standalone GPU tools ask for shaderInt64 (TEST-468). It includes no
+# Vulkan header, so it builds and runs without them, unlike the tools below that use it.
+add_executable(spirv_capability_test test/spirv_capability_test.cpp)
+if(BUILD_TESTING)
+  add_test(NAME spirv_capability COMMAND spirv_capability_test)
+endif()
+
 # GPU test and pipeline tools load Vulkan at run time, so only the Vulkan headers are needed at build time.
 # Nothing is downloaded unless asked: set VULKAN_SDK, install the Vulkan headers, pass
 # -DLEONIDA_VULKAN_HEADERS_FETCH=ON to download the pinned Khronos Vulkan-Headers release once at configure time
@@ -1370,8 +1303,9 @@ if(TARGET Vulkan::Headers)
     endif()
   endif()
   if(BUILD_TESTING)
-    if(WIN32)
+    if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       # Real Win32 environment and DXGI names, with D3D12 device creation stubbed: no GPU commands or game files.
+      # It includes the runtime's D3D12 shim headers, so it needs the same Windows SDK as the runtime.
       add_executable(host_adapter_test test/host_adapter_test.cpp)
       target_link_libraries(host_adapter_test PRIVATE Vulkan::Headers dxgi)
       target_compile_definitions(host_adapter_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -3321,4 +3255,33 @@ if(TARGET Vulkan::Headers)
 else()
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vulkan_headers_missing.cmake")
   leonida_vulkan_headers_missing()
+endif()
+
+# Timed condition-variable waits on Wine 9 (#3796): every Windows executable and DLL built against the dynamic CRT
+# (/MD, the default) gets src/crt_timed_wait.cpp, which keeps msvcprt.lib's statically linked timed wait out of the
+# link so that a wait and the mutex it unlocks always use msvcp140's own layout. A target that links the CRT
+# statically (MSVC_RUNTIME_LIBRARY MultiThreaded, MultiThreadedDebug) already agrees with itself and is left alone,
+# as are the fixtures linked with /NODEFAULTLIB, which have no CRT.
+if(WIN32 AND MSVC)
+  add_library(gta6rt_crt_timed_wait OBJECT src/crt_timed_wait.cpp)
+  target_compile_definitions(gta6rt_crt_timed_wait PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(gta6rt_crt_timed_wait PRIVATE /W4 /permissive- /utf-8)
+  # A timed wait is woken by a thread that takes its mutex; shared_mutex and sleep_for still work.
+  add_executable(crt_timed_wait_test test/crt_timed_wait_test.cpp)
+  target_compile_options(crt_timed_wait_test PRIVATE /W4 /permissive- /EHsc /utf-8)
+  add_test(NAME crt_timed_wait COMMAND crt_timed_wait_test)
+  set_tests_properties(crt_timed_wait PROPERTIES TIMEOUT 60)
+  get_property(_gta6rt_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(_target IN LISTS _gta6rt_targets)
+    get_target_property(_type ${_target} TYPE)
+    if(NOT _type MATCHES "^(EXECUTABLE|SHARED_LIBRARY|MODULE_LIBRARY)$")
+      continue()
+    endif()
+    get_target_property(_crt ${_target} MSVC_RUNTIME_LIBRARY)
+    get_target_property(_link_options ${_target} LINK_OPTIONS)
+    if((_crt AND NOT _crt MATCHES "DLL") OR "/NODEFAULTLIB" IN_LIST _link_options)
+      continue()  # static CRT, or no CRT at all (the CRT-free fixtures)
+    endif()
+    target_sources(${_target} PRIVATE $<TARGET_OBJECTS:gta6rt_crt_timed_wait>)
+  endforeach()
 endif()

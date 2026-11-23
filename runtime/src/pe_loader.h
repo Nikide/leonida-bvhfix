@@ -132,9 +132,6 @@ private:
     void initialise(Module& m);
     static void set_initialised(Module& m, bool value);
     Module* find_narrow_module(const std::string& dll_lower) const;  // caller holds mutex_
-    Module* find_wide_module(const std::wstring& basename) const;    // caller holds mutex_
-    void* load_runtime_candidate(Module* existing, const std::filesystem::path& candidate, uint32_t flags,
-                                 const std::string& display);        // caller holds mutex_
     Module& map_image(const std::filesystem::path& path, const std::string& narrow_key);
     void initialize_tls(Module& m);
     void bind_imports(Module& m);

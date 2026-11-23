@@ -5711,12 +5711,8 @@ public:
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: kind = leonida::IndirectKind::draw_indexed; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: kind = leonida::IndirectKind::dispatch; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
-            // Replayed as vkCmdDrawMeshTasksIndirect(Count)EXT; without VK_EXT_mesh_shader there is no mesh PSO to
-            // run it with (the device reports MeshShaderTier NOT_SUPPORTED then).
-            if (!state_.info.mesh_shader || !state_.context->vk.vkCmdDrawMeshTasksIndirectEXT) return E_NOTIMPL;
-            // Root arguments or views before it would need the per-record expansion the draw kinds lack too
-            // (section 4.7); refuse rather than read the group counts from the record's first bytes.
-            if (desc->NumArgumentDescs != 1) return E_NOTIMPL;
+            // As DispatchMesh: only a device with mesh shaders (MeshShaderTier 1) takes it.
+            if (!state_.info.mesh_shader) return E_NOTIMPL;
             kind = leonida::IndirectKind::dispatch_mesh;
             break;
         default: return E_NOTIMPL;
@@ -9049,12 +9045,61 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         }
         shared = process_instance;
     }
-    const VkInstance instance = shared.instance;
-    const bool surface_maintenance1_khr = shared.surface_maintenance1_khr;
-    const bool surface_maintenance1_ext = shared.surface_maintenance1_ext;
-    const bool swapchain_colorspace_enabled = shared.swapchain_colorspace_enabled;
-    const bool instance_has_surface = shared.instance_has_surface;
-    const bool has_debug_utils = shared.has_debug_utils;
+    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    app.pApplicationName = "gta6rt";
+    app.apiVersion = VK_API_VERSION_1_3;
+    VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    instance_info.pApplicationInfo = &app;
+    const char* layer = "VK_LAYER_KHRONOS_validation";
+    const VkValidationFeatureEnableEXT sync_validation = VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
+    VkValidationFeaturesEXT validation_features{VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT};
+    validation_features.enabledValidationFeatureCount = 1;
+    validation_features.pEnabledValidationFeatures = &sync_validation;
+    char validation[8] = {};
+    size_t length = 0;
+    if (getenv_s(&length, validation, "LEONIDA_VK_VALIDATION") == 0 && length > 1 && validation[0] != '0') {
+        // Ask for the layer only when the loader lists it, and say so when it does not: an instance that cannot be
+        // made because of a missing layer left the caller with "Vulkan unavailable" and no hint that validation was
+        // the cause. Wine does not list the Linux loader's layers to the program and refuses an explicit request for
+        // one, so there only VK_INSTANCE_LAYERS (which Wine keeps out of the program's environment) loads it.
+        bool layer_listed = false;
+        if (const auto enumerate_layers = reinterpret_cast<PFN_vkEnumerateInstanceLayerProperties>(
+                get(nullptr, "vkEnumerateInstanceLayerProperties"))) {
+            std::uint32_t layer_count = 0;
+            enumerate_layers(&layer_count, nullptr);
+            std::vector<VkLayerProperties> layers(layer_count);
+            if (layer_count && enumerate_layers(&layer_count, layers.data()) >= VK_SUCCESS)
+                for (std::uint32_t i = 0; i < layer_count; ++i)
+                    layer_listed = layer_listed || std::strcmp(layers[i].layerName, layer) == 0;
+        }
+        if (layer_listed) {
+            instance_info.pNext = &validation_features;
+            instance_info.enabledLayerCount = 1;
+            instance_info.ppEnabledLayerNames = &layer;
+        } else {
+            std::fprintf(stderr,
+                         "[rt] d3d12: LEONIDA_VK_VALIDATION is set but %s is not listed by the Vulkan loader "
+                         "(install the Vulkan SDK; under Wine set VK_INSTANCE_LAYERS=%s instead)\n",
+                         layer, layer);
+            return E_FAIL;
+        }
+    }
+    // VK_EXT_debug_utils when the loader has it, for the game's debug markers (PIX events) in RenderDoc and the like.
+    const char* debug_utils = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    bool has_debug_utils = false;
+    if (const auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+            get(nullptr, "vkEnumerateInstanceExtensionProperties"))) {
+        std::uint32_t extension_count = 0;
+        enumerate(nullptr, &extension_count, nullptr);
+        std::vector<VkExtensionProperties> extensions(extension_count);
+        enumerate(nullptr, &extension_count, extensions.data());
+        for (const auto& e : extensions) has_debug_utils = has_debug_utils || std::strcmp(e.extensionName, debug_utils) == 0;
+    }
+    // One list: the surface extensions above (for DXGI presentation) and debug utils both go on the instance.
+    const bool instance_has_surface = !inst_exts.empty();
+    if (has_debug_utils) inst_exts.push_back(debug_utils);
+    instance_info.enabledExtensionCount = static_cast<std::uint32_t>(inst_exts.size());
+    instance_info.ppEnabledExtensionNames = inst_exts.empty() ? nullptr : inst_exts.data();
     OwnedRuntime owned{};
     const auto fail = [&](const char* why) {
         std::fprintf(stderr, "[rt] d3d12: %s\n", why);
@@ -9621,10 +9666,6 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     if (swapchain_m1_name) device_extensions.push_back(swapchain_m1_name);
     if (info.mesh_shader) device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
-    if (info.buffer_marker) device_extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
-#if defined(VK_EXT_device_fault)
-    if (info.device_fault) device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
-#endif
     if (info.ray_tracing) {
         device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);

@@ -51,24 +51,6 @@ std::string narrow_module_key(const std::filesystem::path& path) {
     return {};
 }
 
-// Windows matches module names case-insensitively with its own upcase table (RtlEqualUnicodeString); the
-// ordinal ignore-case compare is that table.
-bool same_module_name(const wchar_t* a, const wchar_t* b) {
-    return CompareStringOrdinal(a, -1, b, -1, TRUE) == CSTR_EQUAL;
-}
-
-// A narrow (ANSI code page) module name widened for a case-insensitive compare; empty when it is not valid in the
-// code page.
-std::wstring acp_to_wide(const std::string& narrow) {
-    if (narrow.empty()) return {};
-    const int n = MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, narrow.data(), static_cast<int>(narrow.size()),
-                                      nullptr, 0);
-    if (n <= 0) return {};
-    std::wstring wide(static_cast<size_t>(n), L'\0');
-    MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, narrow.data(), static_cast<int>(narrow.size()), wide.data(), n);
-    return wide;
-}
-
 std::string path_utf8(const std::filesystem::path& path) {
     const auto bytes = path.u8string();
     return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
@@ -1130,33 +1112,11 @@ Module& Loader::load(const std::filesystem::path& image) {
 
 Module* Loader::find_narrow_module(const std::string& dll_lower) const {
     if (dll_lower.empty()) return nullptr;
-    // library_loader and PE import names keep their existing narrow-byte contract: the exact compare below is
-    // bytewise, and the key is never reinterpreted as UTF-8.
+    // library_loader and PE import names keep their existing narrow-byte contract. Do not reinterpret them
+    // as UTF-8 or widen already-folded bytes (which could be part of a multibyte code-page character).
     for (const auto& entry : by_name_)
         if (entry.second->narrow_key == dll_lower) return entry.second;
-    // The key is ASCII case-folded only. A name with letters outside ASCII (Cyrillic in code page 1251, say)
-    // compares case-insensitively through the code page, as GetModuleHandleA does: GUEST_ДА.EXE finds guest_да.exe.
-    // Widening the folded key is safe here: rt::lower() folds ASCII letters only, and no ANSI code page's multibyte
-    // sequences contain ASCII letter bytes, so both sides widen to the same characters they were spelt with.
-    if (const std::wstring wide = acp_to_wide(dll_lower); !wide.empty())
-        for (const auto& entry : by_name_)
-            if (!entry.second->narrow_key.empty() &&
-                same_module_name(acp_to_wide(entry.second->narrow_key).c_str(), wide.c_str()))
-                return entry.second;
     return nullptr;
-}
-
-Module* Loader::find_wide_module(const std::wstring& basename) const {
-    if (basename.empty()) return nullptr;
-    for (const auto& entry : by_name_)
-        if (same_module_name(entry.first.c_str(), basename.c_str())) return entry.second;
-    return nullptr;
-}
-
-void* Loader::find_loaded_module_w(const std::wstring& basename) const {
-    std::lock_guard lock(mutex_);
-    Module* m = find_wide_module(basename);
-    return m ? static_cast<void*>(m->base) : nullptr;
 }
 
 void* Loader::find_loaded_module(const std::string& dll_lower) const {
@@ -1231,7 +1191,7 @@ void* Loader::load_runtime_candidate(Module* existing, const std::filesystem::pa
         // load() drops a module that failed to map or bind (dependencies included); this also drops one whose
         // initialise() failed, so later GetModuleHandle/LoadLibrary calls don't see it. ~Loader frees it via order_.
         by_name_.erase(module_key(mapped ? mapped->path : candidate));
-        std::fprintf(stderr, "[rt] loader: run-time load of %s failed: %s\n", display.c_str(), e.what());
+        std::fprintf(stderr, "[rt] loader: run-time load of %s failed: %s\n", dll_lower.c_str(), e.what());
         SetLastError(ERROR_DLL_INIT_FAILED);
         return nullptr;
     }
@@ -1405,20 +1365,8 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
     m->preferred_base = oh.ImageBase;
     m->size = oh.SizeOfImage;
     m->entry_rva = oh.AddressOfEntryPoint;
-    try {
-        // Inside the range gta6rt reserved for this image before the process started (base_reservation.h), else as usual.
-        m->base = static_cast<uint8_t*>(base_reservation::commit_reserved(oh.ImageBase, oh.SizeOfImage));
-        if (!m->base)
-            m->base = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(oh.ImageBase), oh.SizeOfImage,
-                                                         MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-        if (!m->base) {
-            const auto relocs = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
-            if (!relocs.Size)
-                throw std::runtime_error(m->name + ": preferred base is taken and the image has no relocations");
-            m->base =
-                static_cast<uint8_t*>(VirtualAlloc(nullptr, oh.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-            if (!m->base) throw std::runtime_error(m->name + ": VirtualAlloc failed");
-        }
+    by_name_[module_key(path)] = m;
+    order_.push_back(m);
 
         std::memcpy(m->base, file.data(), oh.SizeOfHeaders);
         auto* sec = IMAGE_FIRST_SECTION(nt);
