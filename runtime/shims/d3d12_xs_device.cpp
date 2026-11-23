@@ -3333,7 +3333,6 @@ unsigned detect_slot_count(ID3D12Device* real) {
 
 }  // namespace
 
-<<<<<<< ours
 void set_xbox_presentation_factory(XboxPresentationFactory factory) {
     g_presentation_factory.store(factory, std::memory_order_release);
 }
@@ -3342,9 +3341,8 @@ void set_device_presentation_window(void* device, std::uint64_t window) {
     if (!is_device_proxy(device)) return;
     static_cast<DeviceProxy*>(device)->presentation_window.store(window, std::memory_order_relaxed);
 }
-=======
+
 IUnknown* real_object_behind_proxy(const void* object) { return proxy_real_object(object); }
->>>>>>> theirs
 
 HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
     if (!real) return E_POINTER;
